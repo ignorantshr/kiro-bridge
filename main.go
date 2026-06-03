@@ -76,6 +76,10 @@ func main() {
 	cwd := env("KIRO_BRIDGE_CWD", ".")
 	cliPath := env("KIRO_CLI_PATH", "kiro-cli")
 	agent := env("KIRO_BRIDGE_AGENT", "kiro-bridge")
+	host := "127.0.0.1"
+	if allIP {
+		host = "0.0.0.0"
+	}
 
 	if cwd == "." {
 		var err error
@@ -85,7 +89,7 @@ func main() {
 		}
 	}
 
-	log.Printf("starting kiro-bridge v%s on 127.0.0.1:%s (cwd=%s, cli=%s, agent=%s)", version, port, cwd, cliPath, agent)
+	log.Printf("starting kiro-bridge v%s on %s:%s (cwd=%s, cli=%s, agent=%s)", version, host, port, cwd, cliPath, agent)
 
 	holder := &bridgeHolder{}
 	cfg := BridgeConfig{CLIPath: cliPath, CWD: cwd, Agent: agent, Version: version}
@@ -118,7 +122,7 @@ func main() {
 		http.NotFound(w, r)
 	})
 
-	server := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%s", port), Handler: logMiddleware(mux)}
+	server := &http.Server{Addr: fmt.Sprintf("%s:%s", host, port), Handler: logMiddleware(mux)}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)

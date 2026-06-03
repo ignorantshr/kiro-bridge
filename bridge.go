@@ -65,8 +65,8 @@ type PromptEventType int
 
 const (
 	EventText           PromptEventType = iota
-	EventToolCall                        // tool_call: new tool invocation
-	EventToolCallUpdate                  // tool_call_update: status change
+	EventToolCall                       // tool_call: new tool invocation
+	EventToolCallUpdate                 // tool_call_update: status change
 )
 
 type bridge struct {
@@ -358,7 +358,9 @@ func (b *bridge) Prompt(blocks []ContentBlock, onEvent func(PromptEvent)) (strin
 			name := update.Title
 			if len(params.Update) > 0 {
 				var raw struct {
-					Meta     *struct{ ToolName string `json:"tool_name"` } `json:"_meta"`
+					Meta *struct {
+						ToolName string `json:"tool_name"`
+					} `json:"_meta"`
 					RawInput json.RawMessage `json:"rawInput"`
 				}
 				json.Unmarshal(params.Update, &raw)
@@ -436,6 +438,21 @@ func (b *bridge) reconnectSession() {
 			log.Printf("failed to set mode after reconnect: %v", err)
 		}
 	}
+}
+
+// ResetSession creates a new session to clear conversation history.
+// This is useful when you want each request to be independent.
+func (b *bridge) ResetSession() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.consecutiveErrs = 0
+	if err := b.newSession(); err != nil {
+		return err
+	}
+	if b.agent != "" {
+		return b.setMode()
+	}
+	return nil
 }
 
 func (b *bridge) Cancel() {

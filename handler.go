@@ -49,6 +49,8 @@ var maxBodyBytes int64 = 1 << 20 // 1MB default
 var showToolAnnotations = os.Getenv("KIRO_BRIDGE_SHOW_TOOLS") != ""
 var replayHistory = os.Getenv("KIRO_BRIDGE_REPLAY_HISTORY") != ""
 var enableImages = os.Getenv("KIRO_BRIDGE_ENABLE_IMAGES") != ""
+var resetSession = os.Getenv("KIRO_BRIDGE_RESET_SESSION") != ""
+var allIP = os.Getenv("KIRO_BRIDGE_ALL_IP") != ""
 
 func init() {
 	if v := os.Getenv("KIRO_BRIDGE_MAX_BODY"); v != "" {
@@ -98,6 +100,15 @@ func handleChatCompletions(b Bridge) http.HandlerFunc {
 			handleStream(w, b, promptBlocks, completionID, created, model)
 		} else {
 			handleNonStream(w, b, promptBlocks, completionID, created, model)
+		}
+
+		// Reset session to avoid history accumulation
+		if resetSession {
+			if rb, ok := b.(interface{ ResetSession() error }); ok {
+				if err := rb.ResetSession(); err != nil {
+					log.Printf("warning: failed to reset session: %v", err)
+				}
+			}
 		}
 	}
 }
