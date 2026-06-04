@@ -248,6 +248,12 @@ type SessionSetModeParams struct {
 	ModeID    string `json:"modeId"`
 }
 
+// SessionSetModelParams switches an ACP session onto a specific model ID.
+type SessionSetModelParams struct {
+	SessionID string `json:"sessionId"`
+	ModelID   string `json:"modelId"`
+}
+
 // SessionCancelParams identifies the ACP session whose current turn should be cancelled.
 type SessionCancelParams struct {
 	SessionID string `json:"sessionId"`

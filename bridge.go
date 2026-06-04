@@ -84,6 +84,8 @@ const (
 
 type SessionMode string
 
+const bridgeDefaultModelID = "kiro"
+
 const (
 	SessionModePerRequest SessionMode = "per_request"
 	SessionModeShared     SessionMode = "shared"
@@ -96,6 +98,38 @@ func parseSessionMode() SessionMode {
 	default:
 		return SessionModePerRequest
 	}
+}
+
+type requestedModelContextKey struct{}
+
+// withRequestedModel threads the OpenAI request model through bridge execution
+// without changing the public handler signatures.
+func withRequestedModel(ctx context.Context, model string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if model = strings.TrimSpace(model); model == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, requestedModelContextKey{}, model)
+}
+
+func requestedModelFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	model, _ := ctx.Value(requestedModelContextKey{}).(string)
+	return strings.TrimSpace(model)
+}
+
+// normalizeRequestedModelID strips the bridge's synthetic fallback alias so
+// only real ACP model IDs trigger session/set_model.
+func normalizeRequestedModelID(model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" || strings.EqualFold(model, bridgeDefaultModelID) {
+		return ""
+	}
+	return model
 }
 
 var errBridgeNotReady = errors.New("bridge not ready")
@@ -115,6 +149,7 @@ type bridge struct {
 	promptCaps      PromptCapabilities
 	ready           bool
 	sharedSessionID string
+	sharedModelID   string
 	lastContextPct  float64
 	closed          bool
 
@@ -137,8 +172,9 @@ type BridgeConfig struct {
 // acpSession is the bridge's internal handle for one ACP session plus the
 // model snapshot observed when that session was created or loaded.
 type acpSession struct {
-	id     string
-	models []ModelInfo
+	id             string
+	currentModelID string
+	models         []ModelInfo
 }
 
 // acpSessionManager owns ACP session lifecycle operations such as new/load and
@@ -232,8 +268,10 @@ func (b *bridge) connect() error {
 	}
 
 	sharedSessionID := ""
+	sharedModelID := ""
 	if b.sessionMode == SessionModeShared {
 		sharedSessionID = discoverySession.id
+		sharedModelID = discoverySession.currentModelID
 	}
 
 	b.stateMu.Lock()
@@ -248,6 +286,7 @@ func (b *bridge) connect() error {
 	b.promptCaps = promptCaps
 	b.ready = true
 	b.sharedSessionID = sharedSessionID
+	b.sharedModelID = sharedModelID
 	b.lastContextPct = 0
 	b.stateMu.Unlock()
 
@@ -326,6 +365,7 @@ func (b *bridge) handleProcessExit(proc *acpProcess) {
 	b.promptCaps = PromptCapabilities{}
 	b.ready = false
 	b.sharedSessionID = ""
+	b.sharedModelID = ""
 	b.lastContextPct = 0
 	b.stateMu.Unlock()
 
@@ -378,11 +418,12 @@ func (b *bridge) Prompt(ctx context.Context, blocks []ContentBlock, onEvent func
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	requestedModel := requestedModelFromContext(ctx)
 
 	b.promptMu.Lock()
 	defer b.promptMu.Unlock()
 
-	proc, sessionID, err := b.sessionForTurn()
+	proc, sessionID, err := b.sessionForTurn(requestedModel)
 	if err != nil {
 		return "", err
 	}
@@ -409,7 +450,7 @@ func (b *bridge) Prompt(ctx context.Context, blocks []ContentBlock, onEvent func
 	return stopReason, nil
 }
 
-func (b *bridge) sessionForTurn() (*acpProcess, string, error) {
+func (b *bridge) sessionForTurn(requestedModel string) (*acpProcess, string, error) {
 	proc, ready := b.currentProcess()
 	if proc == nil || !ready {
 		return nil, "", errBridgeNotReady
@@ -424,8 +465,28 @@ func (b *bridge) sessionForTurn() (*acpProcess, string, error) {
 	if b.sessionMode == SessionModeShared {
 		b.stateMu.RLock()
 		sharedSessionID := b.sharedSessionID
+		sharedModelID := b.sharedModelID
+		sharedModels := append([]ModelInfo(nil), b.models...)
 		b.stateMu.RUnlock()
 		if sharedSessionID != "" {
+			manager := &acpSessionManager{bridge: b, process: proc}
+			appliedModelID, err := manager.ensureModel(sharedSessionID, sharedModelID, sharedModels, requestedModel)
+			if err != nil {
+				select {
+				case <-proc.Done():
+					b.handleProcessExit(proc)
+					return nil, "", errBridgeNotReady
+				default:
+				}
+				return nil, "", err
+			}
+			if appliedModelID != sharedModelID {
+				b.stateMu.Lock()
+				if b.sharedSessionID == sharedSessionID {
+					b.sharedModelID = appliedModelID
+				}
+				b.stateMu.Unlock()
+			}
 			return proc, sharedSessionID, nil
 		}
 	}
@@ -443,11 +504,23 @@ func (b *bridge) sessionForTurn() (*acpProcess, string, error) {
 		}
 		return nil, "", err
 	}
+	appliedModelID, err := manager.ensureModel(session.id, session.currentModelID, session.models, requestedModel)
+	if err != nil {
+		select {
+		case <-proc.Done():
+			b.handleProcessExit(proc)
+			return nil, "", errBridgeNotReady
+		default:
+		}
+		return nil, "", err
+	}
+	session.currentModelID = appliedModelID
 
 	b.stateMu.Lock()
 	b.models = append([]ModelInfo(nil), session.models...)
 	if b.sessionMode == SessionModeShared {
 		b.sharedSessionID = session.id
+		b.sharedModelID = session.currentModelID
 	}
 	b.stateMu.Unlock()
 
@@ -504,6 +577,7 @@ func (b *bridge) Close() error {
 	b.promptCaps = PromptCapabilities{}
 	b.ready = false
 	b.sharedSessionID = ""
+	b.sharedModelID = ""
 	b.stateMu.Unlock()
 
 	if proc != nil {
@@ -887,7 +961,11 @@ func (m *acpSessionManager) NewSession() (*acpSession, error) {
 		return nil, err
 	}
 
-	session := &acpSession{id: result.SessionID, models: modelsFromSession(result.Models)}
+	session := &acpSession{
+		id:             result.SessionID,
+		currentModelID: currentModelIDFromSession(result.Models),
+		models:         modelsFromSession(result.Models),
+	}
 	if m.bridge.cfg.Agent != "" {
 		if err := m.setMode(session.id); err != nil {
 			return nil, fmt.Errorf("set mode: %w", err)
@@ -911,7 +989,11 @@ func (m *acpSessionManager) LoadSession(sessionID string) (*acpSession, error) {
 		return nil, err
 	}
 
-	session := &acpSession{id: result.SessionID, models: modelsFromSession(result.Models)}
+	session := &acpSession{
+		id:             result.SessionID,
+		currentModelID: currentModelIDFromSession(result.Models),
+		models:         modelsFromSession(result.Models),
+	}
 	if m.bridge.cfg.Agent != "" {
 		if err := m.setMode(session.id); err != nil {
 			return nil, fmt.Errorf("set mode: %w", err)
@@ -933,6 +1015,61 @@ func (m *acpSessionManager) setMode(sessionID string) error {
 		return fmt.Errorf("set_mode error: %w", resp.Error)
 	}
 	return nil
+}
+
+// ensureModel applies the requested OpenAI model only when it exists in the
+// session model catalog. Invalid or rejected models fall back to the current
+// session model instead of failing the whole HTTP request.
+func (m *acpSessionManager) ensureModel(sessionID, currentModelID string, availableModels []ModelInfo, requestedModel string) (string, error) {
+	modelID := normalizeRequestedModelID(requestedModel)
+	if modelID == "" || modelID == currentModelID {
+		return currentModelID, nil
+	}
+	if !hasModelID(availableModels, modelID) {
+		debugf("requested model %q unavailable; using current/default model %q", modelID, currentModelID)
+		return currentModelID, nil
+	}
+	if err := m.setModel(sessionID, modelID); err != nil {
+		select {
+		case <-m.process.Done():
+			return currentModelID, fmt.Errorf("set model: %w", err)
+		default:
+		}
+		debugf("failed to set requested model %q; using current/default model %q: %v", modelID, currentModelID, err)
+		return currentModelID, nil
+	}
+	return modelID, nil
+}
+
+func (m *acpSessionManager) setModel(sessionID, modelID string) error {
+	id := m.bridge.nextRequestID()
+	resp, err := m.process.sendRequest(id, "session/set_model", SessionSetModelParams{
+		SessionID: sessionID,
+		ModelID:   modelID,
+	}, nil)
+	if err != nil {
+		return err
+	}
+	if resp.Error != nil {
+		return fmt.Errorf("set_model error: %w", resp.Error)
+	}
+	return nil
+}
+
+func currentModelIDFromSession(models *SessionModels) string {
+	if models == nil {
+		return ""
+	}
+	return models.CurrentModelID
+}
+
+func hasModelID(models []ModelInfo, modelID string) bool {
+	for _, model := range models {
+		if model.ID == modelID {
+			return true
+		}
+	}
+	return false
 }
 
 func modelsFromSession(models *SessionModels) []ModelInfo {

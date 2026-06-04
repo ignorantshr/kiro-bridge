@@ -14,6 +14,7 @@ import (
 type mockBridge struct {
 	chunks               []string
 	gotText              string
+	gotModel             string
 	promptErr            error
 	promptErrAfterChunks bool
 	promptCaps           PromptCapabilities
@@ -23,6 +24,7 @@ func (m *mockBridge) Prompt(ctx context.Context, blocks []ContentBlock, onEvent 
 	if len(blocks) > 0 {
 		m.gotText = blocks[0].Text
 	}
+	m.gotModel = requestedModelFromContext(ctx)
 	if m.promptErr != nil && !m.promptErrAfterChunks {
 		return "", m.promptErr
 	}
@@ -129,6 +131,9 @@ func TestHandleNonStream(t *testing.T) {
 	if mock.gotText != "User: hi" {
 		t.Errorf("prompt text = %q, want %q", mock.gotText, "User: hi")
 	}
+	if mock.gotModel != bridgeDefaultModelID {
+		t.Errorf("prompt model = %q, want %q", mock.gotModel, bridgeDefaultModelID)
+	}
 }
 
 func TestHandleStream(t *testing.T) {
@@ -191,6 +196,25 @@ func TestHandleStream(t *testing.T) {
 	// Last should be [DONE]
 	if events[3] != "[DONE]" {
 		t.Errorf("last event = %q, want %q", events[3], "[DONE]")
+	}
+}
+
+func TestHandleChatCompletionsPassesRequestedModelToBridge(t *testing.T) {
+	mock := &mockBridge{chunks: []string{"ok"}}
+	handler := handleChatCompletions(mock)
+
+	body := `{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if mock.gotModel != "claude-sonnet-4" {
+		t.Fatalf("prompt model = %q, want %q", mock.gotModel, "claude-sonnet-4")
 	}
 }
 
@@ -595,13 +619,15 @@ func TestToolCallOmittedWhenEmpty(t *testing.T) {
 }
 
 type mockBridgeWithToolCalls struct {
-	gotText string
+	gotText  string
+	gotModel string
 }
 
 func (m *mockBridgeWithToolCalls) Prompt(ctx context.Context, blocks []ContentBlock, onEvent func(PromptEvent)) (string, error) {
 	if len(blocks) > 0 {
 		m.gotText = blocks[0].Text
 	}
+	m.gotModel = requestedModelFromContext(ctx)
 	onEvent(PromptEvent{
 		Type:       EventToolCall,
 		ToolCallID: "call_1",

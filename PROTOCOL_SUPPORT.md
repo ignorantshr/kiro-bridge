@@ -14,7 +14,7 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 
 | Field | Status | Notes |
 |-------|--------|-------|
-| `model` | ⚠️ | Echoed in response. Not forwarded to ACP — Kiro selects model internally. |
+| `model` | ⚠️ | Echoed in response and forwarded via `session/set_model` only when it matches an ACP model in the session catalog. Unknown or rejected model IDs fall back to the current/default ACP model. The bridge-local fallback alias `kiro` is not forwarded. |
 | `messages` | ⚠️ | Parsed according to the OpenAI Chat Completions message/content schema, then projected into an ordered ACP transcript. |
 | `stream` | ✅ | Maps to SSE via ACP session notifications. |
 | `temperature` | ❌ | No ACP equivalent. Silently ignored. |
@@ -84,6 +84,7 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 | `session/new` | ✅ | Creates session with CWD. Parses models from response. |
 | `session/load` | ✅ | Implemented internally for ACP session management and tests; not exposed as HTTP API. |
 | `session/prompt` | ✅ | Sends `params.prompt` with text content blocks plus any negotiated native image/audio/resource blocks. |
+| `session/set_model` | ✅ | Applied before a turn when the OpenAI request model exists in the session catalog; unavailable or rejected models fall back to the current/default ACP model. |
 | `session/set_mode` | ✅ | Activates agent config. |
 | `session/list` | ❌ | Not implemented. |
 

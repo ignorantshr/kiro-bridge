@@ -210,6 +210,7 @@ git push origin "$(git branch --show-current)" --tags
 - On startup failure or child-process exit, it retries with exponential backoff (1s→60s cap) instead of crashing. The HTTP server starts immediately and returns 503 while connecting or reconnecting.
 - It keeps one supervised ACP process alive and, by default, creates a fresh ACP session for each HTTP request. Set `KIRO_BRIDGE_SESSION_MODE=shared` to reuse a single ACP session instead.
 - Incoming OpenAI `/v1/chat/completions` requests are translated to ACP `session/prompt` calls using `params.prompt`.
+- When the OpenAI request names a model that exists in the ACP session catalog, the bridge applies it with `session/set_model` before running the turn. Unknown or rejected model IDs fall back to the current/default ACP model. The synthetic fallback model name `kiro` is bridge-local and is not forwarded.
 - ACP `agent_message_chunk` / `AgentMessageChunk` notifications are streamed back as OpenAI SSE chunks, and `TurnEnd` is used when available to determine the final stop reason.
 - Kiro tool calls (file search, web fetch, etc.) happen transparently inside the ACP session — only the final text response is returned to the client.
 - When the HTTP client disconnects or times out, the bridge forwards `session/cancel` to ACP.

@@ -52,6 +52,7 @@ func TestBridgeHelperProcess(t *testing.T) {
 	mode := os.Getenv("KIRO_BRIDGE_HELPER_MODE")
 	countFile := os.Getenv("KIRO_BRIDGE_HELPER_COUNT_FILE")
 	expectedPermissionOption := os.Getenv("KIRO_BRIDGE_EXPECT_PERMISSION_OPTION")
+	expectedModelID := os.Getenv("KIRO_BRIDGE_EXPECT_MODEL_ID")
 	scanner := bufio.NewScanner(os.Stdin)
 	writer := bufio.NewWriter(os.Stdout)
 	sessionCount := 0
@@ -112,7 +113,7 @@ func TestBridgeHelperProcess(t *testing.T) {
 				}
 				break
 			}
-			if mode == "with-models" {
+			if mode == "with-models" || mode == "set-model-error" {
 				resp = map[string]any{
 					"jsonrpc": "2.0",
 					"id":      req.ID,
@@ -144,6 +145,33 @@ func TestBridgeHelperProcess(t *testing.T) {
 					"error": map[string]any{
 						"code":    -32000,
 						"message": "mode activation failed",
+					},
+				}
+				break
+			}
+			resp = map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req.ID,
+				"result":  map[string]any{},
+			}
+		case "session/set_model":
+			var params SessionSetModelParams
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(2)
+			}
+			appendCount("set_model:" + params.ModelID)
+			if expectedModelID != "" && params.ModelID != expectedModelID {
+				fmt.Fprintf(os.Stderr, "model id = %q, want %q\n", params.ModelID, expectedModelID)
+				os.Exit(2)
+			}
+			if mode == "set-model-error" {
+				resp = map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"error": map[string]any{
+						"code":    -32001,
+						"message": "model unavailable",
 					},
 				}
 				break
@@ -1219,6 +1247,202 @@ func TestBridgeSessionModes(t *testing.T) {
 			t.Fatalf("sessions = %v, want reused shared id", sessions)
 		}
 	})
+}
+
+func TestBridgeSetsRequestedModelForTurn(t *testing.T) {
+	oldExecCommand := execCommand
+	countFile := t.TempDir() + "/set-model-count.txt"
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cs := []string{"-test.run=TestBridgeHelperProcess", "--"}
+		cs = append(cs, args...)
+		cmd := exec.Command(os.Args[0], cs...)
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_HELPER_PROCESS=1",
+			"KIRO_BRIDGE_HELPER_MODE=with-models",
+			"KIRO_BRIDGE_HELPER_COUNT_FILE="+countFile,
+			"KIRO_BRIDGE_EXPECT_MODEL_ID=auto",
+		)
+		return cmd
+	}
+	defer func() { execCommand = oldExecCommand }()
+
+	b, err := NewBridge(BridgeConfig{CLIPath: "kiro-cli", CWD: ".", Agent: "", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewBridge: %v", err)
+	}
+	defer b.Close()
+
+	ctx := withRequestedModel(context.Background(), "auto")
+	if _, err := b.Prompt(ctx, []ContentBlock{{Type: "text", Text: "test"}}, func(PromptEvent) {}); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("read count file: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "set_model:auto" {
+		t.Fatalf("count file = %q, want %q", got, "set_model:auto")
+	}
+}
+
+func TestBridgeDoesNotSetSyntheticKiroModel(t *testing.T) {
+	oldExecCommand := execCommand
+	countFile := t.TempDir() + "/set-model-count.txt"
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cs := []string{"-test.run=TestBridgeHelperProcess", "--"}
+		cs = append(cs, args...)
+		cmd := exec.Command(os.Args[0], cs...)
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_HELPER_PROCESS=1",
+			"KIRO_BRIDGE_HELPER_MODE=with-models",
+			"KIRO_BRIDGE_HELPER_COUNT_FILE="+countFile,
+		)
+		return cmd
+	}
+	defer func() { execCommand = oldExecCommand }()
+
+	b, err := NewBridge(BridgeConfig{CLIPath: "kiro-cli", CWD: ".", Agent: "", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewBridge: %v", err)
+	}
+	defer b.Close()
+
+	ctx := withRequestedModel(context.Background(), bridgeDefaultModelID)
+	if _, err := b.Prompt(ctx, []ContentBlock{{Type: "text", Text: "test"}}, func(PromptEvent) {}); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+
+	data, err := os.ReadFile(countFile)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read count file: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "" {
+		t.Fatalf("count file = %q, want empty", got)
+	}
+}
+
+func TestBridgeFallsBackWhenRequestedModelUnavailable(t *testing.T) {
+	oldExecCommand := execCommand
+	countFile := t.TempDir() + "/set-model-count.txt"
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cs := []string{"-test.run=TestBridgeHelperProcess", "--"}
+		cs = append(cs, args...)
+		cmd := exec.Command(os.Args[0], cs...)
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_HELPER_PROCESS=1",
+			"KIRO_BRIDGE_HELPER_MODE=with-models",
+			"KIRO_BRIDGE_HELPER_COUNT_FILE="+countFile,
+		)
+		return cmd
+	}
+	defer func() { execCommand = oldExecCommand }()
+
+	b, err := NewBridge(BridgeConfig{CLIPath: "kiro-cli", CWD: ".", Agent: "", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewBridge: %v", err)
+	}
+	defer b.Close()
+
+	ctx := withRequestedModel(context.Background(), "missing-model")
+	if _, err := b.Prompt(ctx, []ContentBlock{{Type: "text", Text: "test"}}, func(PromptEvent) {}); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+
+	data, err := os.ReadFile(countFile)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read count file: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "" {
+		t.Fatalf("count file = %q, want empty", got)
+	}
+}
+
+func TestBridgeFallsBackWhenSetModelFails(t *testing.T) {
+	oldExecCommand := execCommand
+	countFile := t.TempDir() + "/set-model-count.txt"
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cs := []string{"-test.run=TestBridgeHelperProcess", "--"}
+		cs = append(cs, args...)
+		cmd := exec.Command(os.Args[0], cs...)
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_HELPER_PROCESS=1",
+			"KIRO_BRIDGE_HELPER_MODE=set-model-error",
+			"KIRO_BRIDGE_HELPER_COUNT_FILE="+countFile,
+			"KIRO_BRIDGE_EXPECT_MODEL_ID=auto",
+		)
+		return cmd
+	}
+	defer func() { execCommand = oldExecCommand }()
+
+	b, err := NewBridge(BridgeConfig{CLIPath: "kiro-cli", CWD: ".", Agent: "", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewBridge: %v", err)
+	}
+	defer b.Close()
+
+	ctx := withRequestedModel(context.Background(), "auto")
+	if _, err := b.Prompt(ctx, []ContentBlock{{Type: "text", Text: "test"}}, func(PromptEvent) {}); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("read count file: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "set_model:auto" {
+		t.Fatalf("count file = %q, want %q", got, "set_model:auto")
+	}
+}
+
+func TestBridgeSharedSessionSkipsRepeatedSetModel(t *testing.T) {
+	oldExecCommand := execCommand
+	countFile := t.TempDir() + "/set-model-count.txt"
+	oldMode := os.Getenv("KIRO_BRIDGE_SESSION_MODE")
+	t.Setenv("KIRO_BRIDGE_SESSION_MODE", string(SessionModeShared))
+	defer func() {
+		execCommand = oldExecCommand
+		if oldMode == "" {
+			os.Unsetenv("KIRO_BRIDGE_SESSION_MODE")
+		} else {
+			os.Setenv("KIRO_BRIDGE_SESSION_MODE", oldMode)
+		}
+	}()
+
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cs := []string{"-test.run=TestBridgeHelperProcess", "--"}
+		cs = append(cs, args...)
+		cmd := exec.Command(os.Args[0], cs...)
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_HELPER_PROCESS=1",
+			"KIRO_BRIDGE_HELPER_MODE=with-models",
+			"KIRO_BRIDGE_HELPER_COUNT_FILE="+countFile,
+			"KIRO_BRIDGE_EXPECT_MODEL_ID=auto",
+		)
+		return cmd
+	}
+
+	b, err := NewBridge(BridgeConfig{CLIPath: "kiro-cli", CWD: ".", Agent: "", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewBridge: %v", err)
+	}
+	defer b.Close()
+
+	ctx := withRequestedModel(context.Background(), "auto")
+	for i := 0; i < 2; i++ {
+		if _, err := b.Prompt(ctx, []ContentBlock{{Type: "text", Text: "test"}}, func(PromptEvent) {}); err != nil {
+			t.Fatalf("Prompt %d: %v", i+1, err)
+		}
+	}
+
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("read count file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 1 || lines[0] != "set_model:auto" {
+		t.Fatalf("set_model calls = %v, want one set_model:auto", lines)
+	}
 }
 
 func TestBridgeRecoversAfterProcessExit(t *testing.T) {

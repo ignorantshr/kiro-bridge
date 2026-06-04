@@ -307,15 +307,16 @@ func handleChatCompletions(b Bridge) http.HandlerFunc {
 		created := time.Now().Unix()
 		model := req.Model
 		if model == "" {
-			model = "kiro"
+			model = bridgeDefaultModelID
 		}
+		ctx := withRequestedModel(r.Context(), model)
 
 		debugf("prompt: stream=%v model=%q len=%d", req.Stream, model, len(promptText))
 
 		if req.Stream {
-			handleStream(r.Context(), w, b, promptBlocks, completionID, created, model)
+			handleStream(ctx, w, b, promptBlocks, completionID, created, model)
 		} else {
-			handleNonStream(r.Context(), w, b, promptBlocks, completionID, created, model)
+			handleNonStream(ctx, w, b, promptBlocks, completionID, created, model)
 		}
 	}
 }
