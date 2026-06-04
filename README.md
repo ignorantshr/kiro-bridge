@@ -13,11 +13,11 @@ kiro-bridge is a lightweight HTTP server that translates between the [OpenAI Cha
 
 ### 1. Install
 
-Download a prebuilt binary from [Releases](https://github.com/szympajka/kiro-bridge/releases):
+Download a prebuilt binary from [Releases](https://github.com/ignorantshr/kiro-bridge/releases):
 
 ```bash
 # macOS Apple Silicon
-curl -L https://github.com/szympajka/kiro-bridge/releases/latest/download/kiro-bridge_darwin_arm64.tar.gz | tar xz
+curl -L https://github.com/ignorantshr/kiro-bridge/releases/latest/download/kiro-bridge_darwin_arm64.tar.gz | tar xz
 ```
 
 On macOS, remove the quarantine flag before running:
@@ -206,4 +206,4 @@ git push origin "$(git branch --show-current)" --tags
 
 ---
 
-Built by [szympajka](https://github.com/szympajka) with [Kiro](https://kiro.dev) and for the ❤️ of useful software.
+Built by [ignorantshr](https://github.com/ignorantshr) with Codex and for the ❤️ of useful software.

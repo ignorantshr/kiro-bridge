@@ -23,5 +23,5 @@ checksum:
 
 release:
   github:
-    owner: szympajka
+    owner: ignorantshr
     name: kiro-bridge
