@@ -129,6 +129,57 @@ All configuration is via environment variables:
 | `KIRO_BRIDGE_ALL_IP` | unset | Set to bind the HTTP server to `0.0.0.0` instead of `127.0.0.1` |
 | `KIRO_BRIDGE_CONTEXT_WINDOW` | `218000` | Context window size for token usage estimation |
 
+## Multiple accounts, multiple instances
+
+One `kiro-bridge` process supervises one long-lived `kiro-cli acp` child process, so one bridge instance maps to one Kiro account home directory. To serve multiple Kiro accounts at the same time, run multiple bridge processes with different `HOME`, `KIRO_BRIDGE_PORT`, and `KIRO_BRIDGE_API_KEY` values.
+
+Before starting each bridge instance, log in with `kiro-cli` once under that same `HOME` so the account credentials and local session data already exist there.
+
+### Shell example
+
+```bash
+HOME=/home/ec2-user/kiro-accounts/account-a kiro-cli login
+HOME=/home/ec2-user/kiro-accounts/account-b kiro-cli login
+
+HOME=/home/ec2-user/kiro-accounts/account-a \
+KIRO_BRIDGE_PORT=11435 \
+KIRO_BRIDGE_API_KEY=key-account-a \
+./kiro-bridge
+
+HOME=/home/ec2-user/kiro-accounts/account-b \
+KIRO_BRIDGE_PORT=11436 \
+KIRO_BRIDGE_API_KEY=key-account-b \
+./kiro-bridge
+```
+
+### Separate `.env` files
+
+Create one dotenv file per account:
+
+```dotenv
+# /srv/kiro/account-a.env
+HOME=/home/ec2-user/kiro-accounts/account-a
+KIRO_BRIDGE_PORT=11435
+KIRO_BRIDGE_API_KEY=key-account-a
+```
+
+```dotenv
+# /srv/kiro/account-b.env
+HOME=/home/ec2-user/kiro-accounts/account-b
+KIRO_BRIDGE_PORT=11436
+KIRO_BRIDGE_API_KEY=key-account-b
+```
+
+Start each bridge with a different parent-process `KIRO_BRIDGE_ENV_FILE`:
+
+```bash
+HOME=/home/ec2-user/kiro-accounts/account-a kiro-cli login
+HOME=/home/ec2-user/kiro-accounts/account-b kiro-cli login
+
+KIRO_BRIDGE_ENV_FILE=/srv/kiro/account-a.env ./kiro-bridge
+KIRO_BRIDGE_ENV_FILE=/srv/kiro/account-b.env ./kiro-bridge
+```
+
 ## Running as a background service
 
 ### macOS launchd plist
