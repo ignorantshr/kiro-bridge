@@ -16,7 +16,6 @@ Zero-dependency Go HTTP server. Translates OpenAI API → Kiro ACP (JSON-RPC ove
 ## Before you commit
 
 - `go vet ./... && go test ./...`
-- `nix build` must pass
 - Conventional Commits format
 - No ignored error returns (`_, _`)
 
@@ -32,7 +31,6 @@ Zero-dependency Go HTTP server. Translates OpenAI API → Kiro ACP (JSON-RPC ove
 ## Security decisions
 
 - `agent.json` controls what tools Kiro can use unsupervised. Changing this is a security change.
-- `flake.nix` / `flake.lock` changes affect the build supply chain → review carefully.
 
 ## Going deeper
 

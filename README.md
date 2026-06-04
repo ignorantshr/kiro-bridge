@@ -28,10 +28,6 @@ xattr -d com.apple.quarantine kiro-bridge
 Or build from source:
 
 ```bash
-# with nix (reads .version automatically)
-nix build
-
-# or with go directly
 go build -ldflags "-X main.version=$(cat .version)" -o kiro-bridge .
 ```
 
@@ -58,9 +54,9 @@ Optionally, add `resources` to load steering docs into every session:
 ### 3. Run it
 
 ```bash
-./result/bin/kiro-bridge
+./kiro-bridge
 
-# or with go
+# or run without building a binary
 go run .
 ```
 
@@ -126,34 +122,7 @@ All configuration is via environment variables:
 
 ## Running as a background service
 
-### Option A: Nix Darwin module (recommended)
-
-Add the flake input and import the module:
-
-```nix
-# flake.nix
-inputs.kiro-bridge.url = "github:szympajka/kiro-bridge";
-
-# darwin configuration
-imports = [ inputs.kiro-bridge.darwinModules.default ];
-services.kiro-bridge = {
-  enable = true;
-  user = "youruser";
-};
-```
-
-This sets up a launchd service with sensible defaults. Available options:
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `user` | (required) | macOS username |
-| `cwd` | `/Users/<user>` | Working directory for ACP sessions |
-| `cliPath` | `~/.nix-profile/bin/kiro-cli` | Path to kiro-cli binary |
-| `port` | `11435` | HTTP server port |
-| `agent` | `kiro-bridge` | Kiro agent config to activate |
-| `extraEnv` | `{}` | Extra environment variables |
-
-### Option B: macOS launchd plist (without Nix)
+### macOS launchd plist
 
 Create `~/Library/LaunchAgents/com.kiro-bridge.plist`:
 
@@ -207,9 +176,6 @@ Run benchmarks with `go test -bench=. -benchmem ./...`
 ## Development
 
 ```bash
-# enter dev shell
-nix develop
-
 # run tests
 go test -v ./...
 
@@ -217,14 +183,12 @@ go test -v ./...
 go test -tags e2e -timeout 60s -v ./...
 ```
 
-## Release Helpers
+## Release
 
 ```bash
-# create annotated tag from .version
-nix run .#tag-release
-
-# create the tag, then push the current branch and tags
-nix run .#release
+version="$(tr -d '[:space:]' < .version)"
+git tag -a "v$version" -m "Release v$version"
+git push origin "$(git branch --show-current)" --tags
 ```
 
 ## How it works
