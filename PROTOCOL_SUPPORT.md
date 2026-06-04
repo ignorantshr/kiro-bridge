@@ -31,8 +31,8 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 |------|--------|-------|
 | `system` | ⚠️ | Prepended as "System: " text. Loses role structure. |
 | `user` (string) | ✅ | Direct mapping. |
-| `user` (content array) | ⚠️ | Text parts extracted. Image/audio/file parts dropped. |
-| `assistant` | ❌ | Dropped. No conversation replay. |
+| `user` (content array) | ⚠️ | Text parts extracted. `image_url` parts are parsed separately and forwarded when `KIRO_BRIDGE_ENABLE_IMAGES` is set; other non-text parts are dropped. |
+| `assistant` | ⚠️ | Flattened into prompt text when `KIRO_BRIDGE_REPLAY_HISTORY` is enabled; otherwise dropped. |
 | `tool` | ❌ | Dropped. ACP tools execute server-side. |
 
 ### Content parts
@@ -77,7 +77,7 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 | `authenticate` | ❌ | Not needed — kiro-cli handles auth. |
 | `session/new` | ✅ | Creates session with CWD. Parses models from response. |
 | `session/load` | ❌ | Not implemented. Kiro declares `loadSession: true`. |
-| `session/prompt` | ✅ | Text content blocks only. |
+| `session/prompt` | ✅ | Sends text content blocks and optional image blocks when `KIRO_BRIDGE_ENABLE_IMAGES` is enabled. |
 | `session/set_mode` | ✅ | Activates agent config. |
 | `session/list` | ❌ | Not implemented. |
 
@@ -118,7 +118,7 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 | Type | Status | Notes |
 |------|--------|-------|
 | `text` | ✅ | |
-| `image` | ❌ | Not passed through in prompts or responses. |
+| `image` | ⚠️ | Forwarded in prompts when `KIRO_BRIDGE_ENABLE_IMAGES` is enabled. ACP image responses are not surfaced. |
 | `audio` | ❌ | Kiro declares unsupported. |
 | `resource` (embedded) | ❌ | Kiro declares unsupported. |
 | `resource_link` | ❌ | Not handled. |

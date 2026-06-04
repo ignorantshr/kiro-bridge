@@ -120,6 +120,8 @@ All configuration is via environment variables:
 | `KIRO_BRIDGE_SHOW_TOOLS` | unset | Set to show tool call annotations in responses (experimental) |
 | `KIRO_BRIDGE_REPLAY_HISTORY` | unset | Set to include assistant messages in prompt for conversation replay (experimental) |
 | `KIRO_BRIDGE_ENABLE_IMAGES` | unset | Set to forward image content from OpenAI requests to ACP (experimental) |
+| `KIRO_BRIDGE_RESET_SESSION` | unset | Set to create a fresh ACP session after each request to avoid history accumulation |
+| `KIRO_BRIDGE_ALL_IP` | unset | Set to bind the HTTP server to `0.0.0.0` instead of `127.0.0.1` |
 | `KIRO_BRIDGE_CONTEXT_WINDOW` | `200000` | Context window size for token usage estimation |
 
 ## Running as a background service
@@ -234,7 +236,8 @@ nix run .#release
 - ACP `agent_message_chunk` notifications are streamed back as OpenAI SSE chunks.
 - Kiro tool calls (file search, web fetch, etc.) happen transparently inside the ACP session — only the final text response is returned to the client.
 - When Kiro requests permission for write tools, the bridge rejects by default. Pre-approved tools in the agent config bypass this.
-- System and user messages from the current request are flattened into a single prompt; full conversation replay from `messages[]` is planned but not implemented yet.
+- System and user messages from the current request are flattened into a single prompt; assistant messages are also included when `KIRO_BRIDGE_REPLAY_HISTORY` is enabled.
+- OpenAI `image_url` content is forwarded as ACP image blocks when `KIRO_BRIDGE_ENABLE_IMAGES` is enabled.
 
 ---
 
