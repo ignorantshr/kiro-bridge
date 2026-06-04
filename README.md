@@ -7,7 +7,7 @@ Client  ──POST /v1/chat/completions──▶  kiro-bridge  ──JSON-RPC/st
         ◀──SSE stream────────────────               ◀──session/update────
 ```
 
-kiro-bridge is a lightweight HTTP server that translates between the [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat) and Kiro's [Agent Client Protocol (ACP)](https://agentclientprotocol.com). It spawns `kiro-cli acp` as a backend, so you get everything Kiro offers — models, tools, file access, web search — streamed back through a standard OpenAI endpoint that any client can consume.
+kiro-bridge is a lightweight HTTP server that translates between the [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat) and Kiro's [Agent Client Protocol (ACP)](https://agentclientprotocol.com). The ACP v1 schema reference used by this project is https://agentclientprotocol.com/protocol/v1/schema, but runtime behavior follows `kiro-cli` when the published schema and the actual CLI diverge. It spawns `kiro-cli acp` as a backend, so you get everything Kiro offers — models, tools, file access, web search — streamed back through a standard OpenAI endpoint that any client can consume.
 
 ## Quick start
 
@@ -94,12 +94,12 @@ providers:
 - **Dynamic model list** — `GET /v1/models` serves real models from Kiro (Claude Opus, Sonnet, Haiku, DeepSeek, and more)
 - **Vision support** — forward images from OpenAI `image_url` content to Kiro (experimental)
 - **Tool transparency** — Kiro's tools (file search, grep, web search) run inside the ACP session with optional annotations
-- **Conversation replay** — include assistant message history for multi-turn context (experimental)
+- **Ordered transcript projection** — preserve OpenAI message order and content-part ordering when projecting requests into ACP prompt blocks
 - **Token usage estimation** — approximate token counts from Kiro's context usage metadata
 - **Health endpoint** — `GET /healthz` reports ACP process readiness
 - **Resilient** — supervised `kiro-cli` restarts, per-request session isolation by default, graceful cancellation
 
-> **Tool permissions:** Kiro requests permission for write/edit tools. The bridge rejects these by default. To allow writes, add the tools to `allowedTools` in your agent config so Kiro pre-approves them without asking.
+> **Tool permissions:** `session/request_permission` is rejected by default with `reject_once`. Pre-approved tools in the agent config still bypass the prompt entirely.
 
 ## Configuration
 
@@ -114,8 +114,6 @@ All configuration is via environment variables:
 | `KIRO_BRIDGE_MAX_BODY` | `1048576` | Max request body size in bytes (default 1MB) |
 | `KIRO_BRIDGE_VERBOSE` | unset | Set to enable debug logging |
 | `KIRO_BRIDGE_SHOW_TOOLS` | unset | Set to show tool call annotations in responses (experimental) |
-| `KIRO_BRIDGE_REPLAY_HISTORY` | unset | Set to include assistant messages in prompt for conversation replay (experimental) |
-| `KIRO_BRIDGE_ENABLE_IMAGES` | unset | Set to forward image content from OpenAI requests to ACP (experimental) |
 | `KIRO_BRIDGE_SESSION_MODE` | `per_request` | ACP session strategy: `per_request` creates a new session for each HTTP request, `shared` reuses one session |
 | `KIRO_BRIDGE_ALL_IP` | unset | Set to bind the HTTP server to `0.0.0.0` instead of `127.0.0.1` |
 | `KIRO_BRIDGE_CONTEXT_WINDOW` | `200000` | Context window size for token usage estimation |
@@ -196,13 +194,15 @@ git push origin "$(git branch --show-current)" --tags
 - The bridge spawns `kiro-cli acp` as a child process and communicates via JSON-RPC over stdio.
 - On startup failure or child-process exit, it retries with exponential backoff (1s→60s cap) instead of crashing. The HTTP server starts immediately and returns 503 while connecting or reconnecting.
 - It keeps one supervised ACP process alive and, by default, creates a fresh ACP session for each HTTP request. Set `KIRO_BRIDGE_SESSION_MODE=shared` to reuse a single ACP session instead.
-- Incoming OpenAI `/v1/chat/completions` requests are translated to ACP `session/prompt` calls using `params.content`.
+- Incoming OpenAI `/v1/chat/completions` requests are translated to ACP `session/prompt` calls using `params.prompt`.
 - ACP `agent_message_chunk` / `AgentMessageChunk` notifications are streamed back as OpenAI SSE chunks, and `TurnEnd` is used when available to determine the final stop reason.
 - Kiro tool calls (file search, web fetch, etc.) happen transparently inside the ACP session — only the final text response is returned to the client.
 - When the HTTP client disconnects or times out, the bridge forwards `session/cancel` to ACP.
-- When Kiro requests permission for write tools, the bridge rejects by default. Pre-approved tools in the agent config bypass this.
-- System and user messages from the current request are flattened into a single prompt; assistant messages are also included when `KIRO_BRIDGE_REPLAY_HISTORY` is enabled.
-- OpenAI `image_url` content is forwarded as ACP image blocks when `KIRO_BRIDGE_ENABLE_IMAGES` is enabled.
+- When Kiro requests permission for write tools, the bridge answers `reject_once` by default. Pre-approved tools in the agent config bypass this.
+- OpenAI messages are parsed according to the Chat Completions message/content schema first, then projected into ordered ACP content blocks so multi-turn history and mixed content-part ordering are preserved as much as ACP allows.
+- OpenAI `image_url` content is forwarded as ACP image blocks when the negotiated prompt capabilities include image.
+- OpenAI `input_audio` content is forwarded as ACP audio blocks when the negotiated prompt capabilities include audio; otherwise it falls back to tagged text.
+- OpenAI file parts with inline `file_data` are forwarded as embedded ACP resources when the negotiated prompt capabilities include embedded context; otherwise they fall back to tagged text.
 
 ---
 

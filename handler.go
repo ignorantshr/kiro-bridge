@@ -2,46 +2,268 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"mime"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
-func buildPromptText(messages []ChatMessage) string {
+// buildPromptText renders the ordered text transcript used for debug logging and
+// for text-only fallbacks when building ACP prompt blocks.
+func buildPromptText(messages []ChatMessage, caps PromptCapabilities) string {
 	var parts []string
-	for _, m := range messages {
-		switch m.Role {
-		case "system":
-			parts = append(parts, "System: "+m.Content.Text)
-		case "user":
-			parts = append(parts, m.Content.Text)
-		case "assistant":
-			if replayHistory {
-				parts = append(parts, "Assistant: "+m.Content.Text)
-			}
+	for _, block := range buildPromptBlocks(messages, caps) {
+		if block.Type == "text" && block.Text != "" {
+			parts = append(parts, block.Text)
 		}
 	}
 	return strings.Join(parts, "\n\n")
 }
 
-func buildPromptBlocks(messages []ChatMessage) []ContentBlock {
-	text := buildPromptText(messages)
-	blocks := []ContentBlock{{Type: "text", Text: text}}
-	if enableImages {
-		for _, m := range messages {
-			for _, img := range m.Content.Images {
-				blocks = append(blocks, ContentBlock{Type: "image", MimeType: img.MimeType, Data: img.Data})
-			}
-		}
+// buildPromptBlocks preserves message order and, when possible, the original
+// OpenAI semantics while projecting them onto ACP's linear content-block model.
+func buildPromptBlocks(messages []ChatMessage, caps PromptCapabilities) []ContentBlock {
+	var blocks []ContentBlock
+	for _, m := range messages {
+		blocks = append(blocks, promptBlocksForMessage(m, caps)...)
+	}
+	if len(blocks) == 0 {
+		return []ContentBlock{{Type: "text", Text: ""}}
 	}
 	return blocks
+}
+
+func messageRoleLabel(role string) (string, bool) {
+	switch role {
+	case "developer":
+		return "Developer", true
+	case "system":
+		return "System", true
+	case "user":
+		return "User", true
+	case "assistant":
+		return "Assistant", true
+	case "function":
+		return "Function", true
+	case "tool":
+		return "Tool", true
+	default:
+		return "", false
+	}
+}
+
+func orderedContentParts(content ChatContent) []ChatContentPart {
+	return content.OrderedParts()
+}
+
+func promptBlocksForMessage(message ChatMessage, caps PromptCapabilities) []ContentBlock {
+	label, include := messageRoleLabel(message.Role)
+	if !include {
+		return nil
+	}
+
+	header := label
+	if message.Name != "" {
+		header += "[" + message.Name + "]"
+	}
+	if message.ToolCallID != "" {
+		header += "[" + message.ToolCallID + "]"
+	}
+	header += ": "
+
+	var blocks []ContentBlock
+	headerPending := true
+	for _, part := range orderedContentParts(message.Content) {
+		switch part.Type {
+		case "text":
+			blocks = appendTextPromptBlock(blocks, &headerPending, header, part.Text)
+		case "refusal":
+			blocks = appendTextPromptBlock(blocks, &headerPending, header, "Refusal: "+part.Refusal)
+		case "image_url":
+			if block, ok := imagePromptBlock(part.ImageURL, caps); ok {
+				blocks = appendHeaderIfNeeded(blocks, &headerPending, header)
+				blocks = append(blocks, block)
+				continue
+			}
+			blocks = appendStructuredPromptBlock(blocks, &headerPending, header, "Image", part)
+		case "input_audio":
+			if block, ok := audioPromptBlock(part.InputAudio, caps); ok {
+				blocks = appendHeaderIfNeeded(blocks, &headerPending, header)
+				blocks = append(blocks, block)
+				continue
+			}
+			blocks = appendStructuredPromptBlock(blocks, &headerPending, header, "InputAudio", part)
+		case "file":
+			if block, ok := filePromptBlock(part.File, caps); ok {
+				blocks = appendHeaderIfNeeded(blocks, &headerPending, header)
+				blocks = append(blocks, block)
+				continue
+			}
+			blocks = appendStructuredPromptBlock(blocks, &headerPending, header, "File", part)
+		}
+	}
+
+	if message.FunctionCall != nil {
+		blocks = appendStructuredPromptBlock(blocks, &headerPending, header, "FunctionCall", message.FunctionCall)
+	}
+	if len(message.ToolCalls) > 0 {
+		blocks = appendStructuredPromptBlock(blocks, &headerPending, header, "ToolCalls", message.ToolCalls)
+	}
+	if message.Audio != nil {
+		blocks = appendStructuredPromptBlock(blocks, &headerPending, header, "Audio", message.Audio)
+	}
+	if headerPending {
+		blocks = append(blocks, ContentBlock{Type: "text", Text: strings.TrimSpace(header)})
+	}
+	return blocks
+}
+
+func appendHeaderIfNeeded(blocks []ContentBlock, headerPending *bool, header string) []ContentBlock {
+	if *headerPending {
+		blocks = append(blocks, ContentBlock{Type: "text", Text: strings.TrimSpace(header)})
+		*headerPending = false
+	}
+	return blocks
+}
+
+func appendTextPromptBlock(blocks []ContentBlock, headerPending *bool, header, text string) []ContentBlock {
+	if text == "" {
+		return blocks
+	}
+	if *headerPending {
+		text = header + text
+		*headerPending = false
+	}
+	return append(blocks, ContentBlock{Type: "text", Text: text})
+}
+
+func appendStructuredPromptBlock(blocks []ContentBlock, headerPending *bool, header, label string, payload any) []ContentBlock {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return appendTextPromptBlock(blocks, headerPending, header, label)
+	}
+	return appendTextPromptBlock(blocks, headerPending, header, fmt.Sprintf("%s: %s", label, data))
+}
+
+// imagePromptBlock upgrades OpenAI image_url parts to native ACP image blocks
+// only when the negotiated prompt capabilities explicitly allow image input.
+func imagePromptBlock(part *ImageURLPart, caps PromptCapabilities) (ContentBlock, bool) {
+	if !caps.Image || part == nil {
+		return ContentBlock{}, false
+	}
+	mimeType, data := parseDataURI(part.URL)
+	if data == "" {
+		return ContentBlock{}, false
+	}
+	return ContentBlock{Type: "image", MimeType: mimeType, Data: data}, true
+}
+
+// audioPromptBlock upgrades OpenAI input_audio parts to native ACP audio blocks
+// only when the negotiated prompt capabilities explicitly allow audio input.
+func audioPromptBlock(part *InputAudioPart, caps PromptCapabilities) (ContentBlock, bool) {
+	if !caps.Audio || part == nil || part.Data == "" {
+		return ContentBlock{}, false
+	}
+	mimeType, ok := openAIInputAudioMimeType(part.Format)
+	if !ok {
+		return ContentBlock{}, false
+	}
+	return ContentBlock{Type: "audio", MimeType: mimeType, Data: part.Data}, true
+}
+
+func openAIInputAudioMimeType(format string) (string, bool) {
+	switch strings.ToLower(format) {
+	case "wav":
+		return "audio/wav", true
+	case "mp3":
+		return "audio/mpeg", true
+	default:
+		return "", false
+	}
+}
+
+// filePromptBlock upgrades inline OpenAI file content into an embedded ACP
+// resource. File IDs without inline bytes still fall back to structured text
+// because the bridge has no dereferenceable URI for the agent to load.
+func filePromptBlock(part *FileContentPart, caps PromptCapabilities) (ContentBlock, bool) {
+	if !caps.EmbeddedContext || part == nil || part.FileData == "" {
+		return ContentBlock{}, false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(part.FileData)
+	if err != nil {
+		return ContentBlock{}, false
+	}
+	mimeType := mime.TypeByExtension(strings.ToLower(fileExtension(part.Filename)))
+	resource := &EmbeddedResource{
+		URI:      embeddedResourceURI(part),
+		MimeType: mimeType,
+	}
+	if text, ok := embeddedResourceText(decoded, mimeType); ok {
+		resource.Text = text
+		if resource.MimeType == "" {
+			resource.MimeType = "text/plain"
+		}
+	} else {
+		resource.Blob = part.FileData
+		if resource.MimeType == "" {
+			resource.MimeType = "application/octet-stream"
+		}
+	}
+	return ContentBlock{Type: "resource", Resource: resource}, true
+}
+
+// embeddedResourceURI reuses the original file identifier when possible instead
+// of inventing a synthetic scheme-specific URI.
+func embeddedResourceURI(part *FileContentPart) string {
+	if part == nil {
+		return "embedded"
+	}
+	switch {
+	case part.FileID != "":
+		return part.FileID
+	case part.Filename != "":
+		return part.Filename
+	default:
+		return "embedded"
+	}
+}
+
+func embeddedResourceText(decoded []byte, mimeType string) (string, bool) {
+	if !utf8.Valid(decoded) {
+		return "", false
+	}
+	if mimeType == "" || strings.HasPrefix(mimeType, "text/") {
+		return string(decoded), true
+	}
+	switch mimeType {
+	case "application/json",
+		"application/xml",
+		"application/yaml",
+		"application/x-yaml",
+		"application/javascript",
+		"application/x-javascript",
+		"application/ecmascript",
+		"image/svg+xml":
+		return string(decoded), true
+	default:
+		return "", false
+	}
+}
+
+func fileExtension(name string) string {
+	if idx := strings.LastIndex(name, "."); idx >= 0 {
+		return name[idx:]
+	}
+	return ""
 }
 
 var completionCounter int64
@@ -49,8 +271,6 @@ var completionCounter int64
 var maxBodyBytes int64 = 1 << 20 // 1MB default
 
 var showToolAnnotations = os.Getenv("KIRO_BRIDGE_SHOW_TOOLS") != ""
-var replayHistory = os.Getenv("KIRO_BRIDGE_REPLAY_HISTORY") != ""
-var enableImages = os.Getenv("KIRO_BRIDGE_ENABLE_IMAGES") != ""
 var allIP = os.Getenv("KIRO_BRIDGE_ALL_IP") != ""
 
 func init() {
@@ -84,14 +304,15 @@ func handleChatCompletions(b Bridge) http.HandlerFunc {
 			return
 		}
 
+		caps := b.PromptCapabilities()
 		if len(req.Messages) == 0 {
 			log.Printf("error: empty messages")
 			http.Error(w, "messages required", http.StatusBadRequest)
 			return
 		}
 
-		promptText := buildPromptText(req.Messages)
-		promptBlocks := buildPromptBlocks(req.Messages)
+		promptText := buildPromptText(req.Messages, caps)
+		promptBlocks := buildPromptBlocks(req.Messages, caps)
 		completionID := newCompletionID()
 		created := time.Now().Unix()
 		model := req.Model
@@ -145,15 +366,15 @@ func handleStream(ctx context.Context, w http.ResponseWriter, b Bridge, prompt [
 	first := true
 	streamStarted := false
 	stopReason, err := b.Prompt(ctx, prompt, func(ev PromptEvent) {
-		var delta *ChatMessage
+		var delta *ChatCompletionDelta
 		switch ev.Type {
 		case EventText:
-			delta = &ChatMessage{Content: ChatContent{Text: ev.Text}}
+			delta = &ChatCompletionDelta{Content: ev.Text}
 		case EventToolCall:
 			if !showToolAnnotations {
 				return
 			}
-			delta = &ChatMessage{Content: ChatContent{Text: fmt.Sprintf("\n\n🔧 %s\n\n---\n\n", ev.ToolName)}}
+			delta = &ChatCompletionDelta{Content: fmt.Sprintf("\n\n🔧 %s\n\n---\n\n", ev.ToolName)}
 		default:
 			return
 		}
@@ -229,7 +450,7 @@ func handleNonStream(ctx context.Context, w http.ResponseWriter, b Bridge, promp
 		Model:   model,
 		Choices: []ChatChoice{{
 			Index:        0,
-			Message:      &ChatMessage{Role: "assistant", Content: ChatContent{Text: full.String()}},
+			Message:      &ChatCompletionMessage{Role: "assistant", Content: full.String()},
 			FinishReason: &fr,
 		}},
 		Usage: &ChatUsage{TotalTokens: usage.TotalTokens},

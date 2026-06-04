@@ -51,6 +51,7 @@ func TestBridgeHelperProcess(t *testing.T) {
 
 	mode := os.Getenv("KIRO_BRIDGE_HELPER_MODE")
 	countFile := os.Getenv("KIRO_BRIDGE_HELPER_COUNT_FILE")
+	expectedPermissionOption := os.Getenv("KIRO_BRIDGE_EXPECT_PERMISSION_OPTION")
 	scanner := bufio.NewScanner(os.Stdin)
 	writer := bufio.NewWriter(os.Stdout)
 	sessionCount := 0
@@ -89,6 +90,14 @@ func TestBridgeHelperProcess(t *testing.T) {
 				"id":      req.ID,
 				"result": map[string]any{
 					"protocolVersion": 1,
+					"agentCapabilities": map[string]any{
+						"loadSession": true,
+						"promptCapabilities": map[string]any{
+							"image":           true,
+							"audio":           true,
+							"embeddedContext": true,
+						},
+					},
 				},
 			}
 		case "session/new":
@@ -160,18 +169,18 @@ func TestBridgeHelperProcess(t *testing.T) {
 			if mode == "crash-on-prompt" {
 				os.Exit(1)
 			}
-			if mode == "content-field" {
+			if mode == "prompt-field" {
 				var params map[string]json.RawMessage
 				if err := json.Unmarshal(req.Params, &params); err != nil {
 					fmt.Fprintln(os.Stderr, err)
 					os.Exit(2)
 				}
-				if _, ok := params["content"]; !ok {
-					fmt.Fprintln(os.Stderr, "missing content field")
+				if _, ok := params["prompt"]; !ok {
+					fmt.Fprintln(os.Stderr, "missing prompt field")
 					os.Exit(2)
 				}
-				if _, ok := params["prompt"]; ok {
-					fmt.Fprintln(os.Stderr, "unexpected prompt field")
+				if _, ok := params["content"]; ok {
+					fmt.Fprintln(os.Stderr, "unexpected content field")
 					os.Exit(2)
 				}
 				resp = map[string]any{
@@ -538,6 +547,20 @@ func TestBridgeHelperProcess(t *testing.T) {
 				if !scanner.Scan() {
 					os.Exit(2)
 				}
+				var permResp Response
+				if err := json.Unmarshal(scanner.Bytes(), &permResp); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(2)
+				}
+				var permResult RequestPermissionResult
+				if err := json.Unmarshal(permResp.Result, &permResult); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(2)
+				}
+				if expectedPermissionOption != "" && permResult.Outcome.OptionID != expectedPermissionOption {
+					fmt.Fprintf(os.Stderr, "permission option = %q, want %q\n", permResult.Outcome.OptionID, expectedPermissionOption)
+					os.Exit(2)
+				}
 
 				// Now send a message chunk and the prompt response
 				chunk := map[string]any{
@@ -623,7 +646,7 @@ func TestNewBridgeSetModeErrorIncludesCode(t *testing.T) {
 	}
 }
 
-func TestBridgeRejectsPermissionRequest(t *testing.T) {
+func TestBridgeDefaultsToRejectPermissionDecision(t *testing.T) {
 	oldExecCommand := execCommand
 	execCommand = func(name string, args ...string) *exec.Cmd {
 		cs := []string{"-test.run=TestBridgeHelperProcess", "--"}
@@ -632,6 +655,7 @@ func TestBridgeRejectsPermissionRequest(t *testing.T) {
 		cmd.Env = append(os.Environ(),
 			"GO_WANT_HELPER_PROCESS=1",
 			"KIRO_BRIDGE_HELPER_MODE=permission-request",
+			"KIRO_BRIDGE_EXPECT_PERMISSION_OPTION=reject_once",
 		)
 		return cmd
 	}
@@ -657,9 +681,67 @@ func TestBridgeRejectsPermissionRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Prompt: %v", err)
 	}
-	// Prompt should complete without deadlocking — the rejection unblocks the turn
 	if len(chunks) == 0 {
 		t.Fatal("expected at least one chunk")
+	}
+}
+
+func TestBridgeUsesConfiguredPermissionDecision(t *testing.T) {
+	oldExecCommand := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cs := []string{"-test.run=TestBridgeHelperProcess", "--"}
+		cs = append(cs, args...)
+		cmd := exec.Command(os.Args[0], cs...)
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_HELPER_PROCESS=1",
+			"KIRO_BRIDGE_HELPER_MODE=permission-request",
+			"KIRO_BRIDGE_EXPECT_PERMISSION_OPTION=allow_once",
+		)
+		return cmd
+	}
+	defer func() { execCommand = oldExecCommand }()
+
+	b, err := NewBridge(BridgeConfig{
+		CLIPath: "kiro-cli",
+		CWD:     ".",
+		Agent:   "kiro-bridge",
+		Version: "test",
+		PermissionDecider: func(RequestPermissionParams) RequestPermissionOutcome {
+			return RequestPermissionOutcome{Outcome: "selected", OptionID: "allow_once"}
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewBridge: %v", err)
+	}
+	defer b.Close()
+
+	var chunks []string
+	_, err = b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "create a file"}}, func(ev PromptEvent) {
+		if ev.Type == EventText {
+			chunks = append(chunks, ev.Text)
+		}
+	})
+	if err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	// Prompt should complete without deadlocking and the configured choice should
+	// be forwarded back to the helper ACP process.
+	if len(chunks) == 0 {
+		t.Fatal("expected at least one chunk")
+	}
+}
+
+func TestDefaultPermissionOutcomePrefersRejectOnce(t *testing.T) {
+	params := RequestPermissionParams{
+		ToolCall: PermissionToolCall{Title: "Creating file"},
+		Options: []PermissionOption{
+			{OptionID: "allow_once", Name: "Yes"},
+			{OptionID: "reject_once", Name: "No"},
+		},
+	}
+	outcome := defaultPermissionOutcome(params.Options)
+	if outcome.OptionID != "reject_once" {
+		t.Fatalf("option = %q, want reject_once", outcome.OptionID)
 	}
 }
 
@@ -767,7 +849,11 @@ func TestInitializeParamsIncludesCapabilities(t *testing.T) {
 	params := InitializeParams{
 		ProtocolVersion: 1,
 		ClientCapabilities: ClientCapabilities{
-			PromptCapabilities: &PromptCapabilities{Image: true},
+			PromptCapabilities: &PromptCapabilities{
+				Image:           true,
+				Audio:           true,
+				EmbeddedContext: true,
+			},
 		},
 		ClientInfo: ClientInfo{Name: "kiro-bridge", Title: "Kiro Bridge", Version: "test"},
 	}
@@ -778,6 +864,12 @@ func TestInitializeParamsIncludesCapabilities(t *testing.T) {
 	s := string(data)
 	if !strings.Contains(s, `"image":true`) {
 		t.Errorf("should declare image support: %s", s)
+	}
+	if !strings.Contains(s, `"audio":true`) {
+		t.Errorf("should declare audio capability explicitly: %s", s)
+	}
+	if !strings.Contains(s, `"embeddedContext":true`) {
+		t.Errorf("should declare embeddedContext capability explicitly: %s", s)
 	}
 	if !strings.Contains(s, `"promptCapabilities"`) {
 		t.Errorf("should have promptCapabilities: %s", s)
@@ -967,7 +1059,7 @@ func TestBridgeCapturesContextUsage(t *testing.T) {
 	}
 }
 
-func TestBridgeUsesContentFieldForPrompt(t *testing.T) {
+func TestBridgeUsesPromptFieldForPrompt(t *testing.T) {
 	oldExecCommand := execCommand
 	execCommand = func(name string, args ...string) *exec.Cmd {
 		cs := []string{"-test.run=TestBridgeHelperProcess", "--"}
@@ -975,7 +1067,7 @@ func TestBridgeUsesContentFieldForPrompt(t *testing.T) {
 		cmd := exec.Command(os.Args[0], cs...)
 		cmd.Env = append(os.Environ(),
 			"GO_WANT_HELPER_PROCESS=1",
-			"KIRO_BRIDGE_HELPER_MODE=content-field",
+			"KIRO_BRIDGE_HELPER_MODE=prompt-field",
 		)
 		return cmd
 	}

@@ -10,12 +10,12 @@ import (
 
 func BenchmarkBuildPromptText(b *testing.B) {
 	msgs := []ChatMessage{
-		{Role: "system", Content: ChatContent{Text: strings.Repeat("system context ", 100)}},
-		{Role: "user", Content: ChatContent{Text: "what is 2+2?"}},
+		{Role: "system", Content: textChatContent(strings.Repeat("system context ", 100))},
+		{Role: "user", Content: textChatContent("what is 2+2?")},
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buildPromptText(msgs)
+		buildPromptText(msgs, PromptCapabilities{})
 	}
 }
 

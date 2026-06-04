@@ -25,7 +25,7 @@ func (id *RPCID) UnmarshalJSON(data []byte) error {
 	return json.Unmarshal(data, &id.Num)
 }
 
-func IntID(n int) RPCID  { return RPCID{Num: n} }
+func IntID(n int) RPCID    { return RPCID{Num: n} }
 func StrID(s string) RPCID { return RPCID{Str: s} }
 
 // Request is a generic JSON-RPC request or request-like envelope used for ACP
@@ -49,7 +49,7 @@ type Response struct {
 type messageType int
 
 const (
-	messageResponse     messageType = iota
+	messageResponse messageType = iota
 	messageRequest
 	messageNotification
 	messageUnknown
@@ -101,9 +101,9 @@ func isResponse(line []byte) bool {
 // RPCError preserves ACP/JSON-RPC error payloads so higher layers can report
 // agent failures without losing protocol context.
 type RPCError struct {
-	Code    int              `json:"code"`
-	Message string           `json:"message"`
-	Data    json.RawMessage  `json:"data,omitempty"`
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data,omitempty"`
 }
 
 func (e *RPCError) Error() string {
@@ -135,9 +135,11 @@ type ClientCapabilities struct {
 	PromptCapabilities *PromptCapabilities `json:"promptCapabilities,omitempty"`
 }
 
-// PromptCapabilities describes prompt content types supported by the bridge.
+// PromptCapabilities describes the ACP prompt content types the bridge may send.
 type PromptCapabilities struct {
-	Image bool `json:"image"`
+	Image           bool `json:"image"`
+	Audio           bool `json:"audio"`
+	EmbeddedContext bool `json:"embeddedContext"`
 }
 
 // ClientInfo identifies the bridge to the ACP server during initialization.
@@ -149,8 +151,15 @@ type ClientInfo struct {
 
 // InitializeResult captures the server capability metadata returned by ACP.
 type InitializeResult struct {
-	ProtocolVersion   int             `json:"protocolVersion"`
-	AgentCapabilities json.RawMessage `json:"agentCapabilities"`
+	ProtocolVersion   int               `json:"protocolVersion"`
+	AgentCapabilities AgentCapabilities `json:"agentCapabilities"`
+}
+
+// AgentCapabilities is the subset of initialize response capabilities the
+// bridge needs in order to decide which prompt block types it may send.
+type AgentCapabilities struct {
+	LoadSession        bool               `json:"loadSession,omitempty"`
+	PromptCapabilities PromptCapabilities `json:"promptCapabilities"`
 }
 
 // SessionNewParams requests a fresh ACP session rooted at a working directory.
@@ -166,8 +175,8 @@ func NewSessionNewParams(cwd string) SessionNewParams {
 // SessionNewResult holds the ACP session identifier and optional model catalog
 // returned when a new session is created.
 type SessionNewResult struct {
-	SessionID string           `json:"sessionId"`
-	Models    *SessionModels   `json:"models,omitempty"`
+	SessionID string         `json:"sessionId"`
+	Models    *SessionModels `json:"models,omitempty"`
 }
 
 // SessionLoadParams requests an existing ACP session by identifier.
@@ -197,15 +206,34 @@ type SessionModel struct {
 // SessionPromptParams is the ACP request payload for one prompt turn.
 type SessionPromptParams struct {
 	SessionID string         `json:"sessionId"`
-	Content   []ContentBlock `json:"content"`
+	Content   []ContentBlock `json:"prompt"`
 }
 
-// ContentBlock is the bridge's shared representation for ACP prompt content.
+// ContentBlock mirrors the ACP ContentBlock schema. The bridge currently emits
+// only text and, when enabled, image blocks, but it keeps the full schema here
+// so protocol handling does not invent unsupported shapes.
 type ContentBlock struct {
-	Type     string `json:"type"`
-	Text     string `json:"text,omitempty"`
-	MimeType string `json:"mimeType,omitempty"`
-	Data     string `json:"data,omitempty"`
+	Type        string            `json:"type"`
+	Text        string            `json:"text,omitempty"`
+	MimeType    string            `json:"mimeType,omitempty"`
+	Data        string            `json:"data,omitempty"`
+	URI         string            `json:"uri,omitempty"`
+	Name        string            `json:"name,omitempty"`
+	Title       string            `json:"title,omitempty"`
+	Description string            `json:"description,omitempty"`
+	Size        int64             `json:"size,omitempty"`
+	Resource    *EmbeddedResource `json:"resource,omitempty"`
+	Annotations json.RawMessage   `json:"annotations,omitempty"`
+}
+
+// EmbeddedResource mirrors ACP's embedded resource payload, which can carry
+// either inline text content or inline binary content.
+type EmbeddedResource struct {
+	URI         string          `json:"uri"`
+	MimeType    string          `json:"mimeType,omitempty"`
+	Text        string          `json:"text,omitempty"`
+	Blob        string          `json:"blob,omitempty"`
+	Annotations json.RawMessage `json:"annotations,omitempty"`
 }
 
 // SessionPromptResult captures the fallback stop reason returned in the final
@@ -223,6 +251,43 @@ type SessionSetModeParams struct {
 // SessionCancelParams identifies the ACP session whose current turn should be cancelled.
 type SessionCancelParams struct {
 	SessionID string `json:"sessionId"`
+}
+
+// RequestPermissionParams is the ACP client method payload an agent sends when
+// it needs the user to choose a permission option for a tool call.
+type RequestPermissionParams struct {
+	SessionID string             `json:"sessionId"`
+	ToolCall  PermissionToolCall `json:"toolCall"`
+	Options   []PermissionOption `json:"options"`
+}
+
+// PermissionToolCall is the subset of tool-call metadata surfaced in ACP
+// permission requests and used for user-facing prompts.
+type PermissionToolCall struct {
+	ToolCallID string          `json:"toolCallId"`
+	Title      string          `json:"title,omitempty"`
+	Kind       string          `json:"kind,omitempty"`
+	RawInput   json.RawMessage `json:"rawInput,omitempty"`
+}
+
+// PermissionOption is one selectable outcome presented to the user.
+type PermissionOption struct {
+	OptionID string `json:"optionId"`
+	Name     string `json:"name,omitempty"`
+	Kind     string `json:"kind,omitempty"`
+}
+
+// RequestPermissionResult is the client's response payload for
+// session/request_permission.
+type RequestPermissionResult struct {
+	Outcome RequestPermissionOutcome `json:"outcome"`
+}
+
+// RequestPermissionOutcome is either a concrete selected option or a cancelled
+// result when the current prompt turn was aborted.
+type RequestPermissionOutcome struct {
+	Outcome  string `json:"outcome"`
+	OptionID string `json:"optionId,omitempty"`
 }
 
 // SessionUpdateParams wraps one ACP session update notification payload.

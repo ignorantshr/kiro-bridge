@@ -338,3 +338,55 @@ func TestSessionUpdateToolCallContentArray(t *testing.T) {
 		t.Errorf("toolCallId = %q, want %q", su.ToolCallID, "call_1")
 	}
 }
+
+func TestContentBlockSupportsSchemaFields(t *testing.T) {
+	block := ContentBlock{
+		Type:        "resource_link",
+		URI:         "file:///tmp/example.txt",
+		Name:        "example.txt",
+		Title:       "Example",
+		Description: "Schema-aligned resource link",
+		Size:        12,
+	}
+	data, err := json.Marshal(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	if !strings.Contains(s, `"type":"resource_link"`) {
+		t.Fatalf("missing type: %s", s)
+	}
+	if !strings.Contains(s, `"uri":"file:///tmp/example.txt"`) {
+		t.Fatalf("missing uri: %s", s)
+	}
+	if !strings.Contains(s, `"name":"example.txt"`) {
+		t.Fatalf("missing name: %s", s)
+	}
+}
+
+func TestInitializeParamsPromptCapabilitiesIncludeSchemaFlags(t *testing.T) {
+	params := InitializeParams{
+		ProtocolVersion: 1,
+		ClientCapabilities: ClientCapabilities{
+			PromptCapabilities: &PromptCapabilities{
+				Image:           true,
+				Audio:           true,
+				EmbeddedContext: true,
+			},
+		},
+	}
+	data, err := json.Marshal(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(data)
+	if !strings.Contains(s, `"image":true`) {
+		t.Fatalf("missing image capability: %s", s)
+	}
+	if !strings.Contains(s, `"audio":true`) {
+		t.Fatalf("missing audio capability: %s", s)
+	}
+	if !strings.Contains(s, `"embeddedContext":true`) {
+		t.Fatalf("missing embeddedContext capability: %s", s)
+	}
+}

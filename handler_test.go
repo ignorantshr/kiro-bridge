@@ -16,6 +16,7 @@ type mockBridge struct {
 	gotText              string
 	promptErr            error
 	promptErrAfterChunks bool
+	promptCaps           PromptCapabilities
 }
 
 func (m *mockBridge) Prompt(ctx context.Context, blocks []ContentBlock, onEvent func(PromptEvent)) (string, error) {
@@ -36,8 +37,11 @@ func (m *mockBridge) Prompt(ctx context.Context, blocks []ContentBlock, onEvent 
 
 func (m *mockBridge) Close() error        { return nil }
 func (m *mockBridge) Models() []ModelInfo { return nil }
-func (m *mockBridge) Usage() UsageInfo    { return UsageInfo{} }
-func (m *mockBridge) Ready() bool         { return true }
+func (m *mockBridge) PromptCapabilities() PromptCapabilities {
+	return m.promptCaps
+}
+func (m *mockBridge) Usage() UsageInfo { return UsageInfo{} }
+func (m *mockBridge) Ready() bool      { return true }
 
 func TestBuildPromptTextWithContentParts(t *testing.T) {
 	body := `{"messages":[{"role":"system","content":"Be helpful."},{"role":"user","content":[{"type":"text","text":"hello"}]}],"model":"kiro","stream":true}`
@@ -45,7 +49,7 @@ func TestBuildPromptTextWithContentParts(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &req); err != nil {
 		t.Fatal(err)
 	}
-	got := buildPromptText(req.Messages)
+	got := buildPromptText(req.Messages, PromptCapabilities{})
 	if !strings.Contains(got, "hello") {
 		t.Errorf("expected 'hello' in prompt, got: %q", got)
 	}
@@ -59,31 +63,31 @@ func TestBuildPromptText(t *testing.T) {
 	}{
 		{
 			name:     "user only",
-			messages: []ChatMessage{{Role: "user", Content: ChatContent{Text: "hello"}}},
-			want:     "hello",
+			messages: []ChatMessage{{Role: "user", Content: textChatContent("hello")}},
+			want:     "User: hello",
 		},
 		{
 			name: "system + user",
 			messages: []ChatMessage{
-				{Role: "system", Content: ChatContent{Text: "You are helpful."}},
-				{Role: "user", Content: ChatContent{Text: "hello"}},
+				{Role: "system", Content: textChatContent("You are helpful.")},
+				{Role: "user", Content: textChatContent("hello")},
 			},
-			want: "System: You are helpful.\n\nhello",
+			want: "System: You are helpful.\n\nUser: hello",
 		},
 		{
-			name: "ignores assistant messages",
+			name: "preserves assistant messages",
 			messages: []ChatMessage{
-				{Role: "user", Content: ChatContent{Text: "hi"}},
-				{Role: "assistant", Content: ChatContent{Text: "hey"}},
-				{Role: "user", Content: ChatContent{Text: "bye"}},
+				{Role: "user", Content: textChatContent("hi")},
+				{Role: "assistant", Content: textChatContent("hey")},
+				{Role: "user", Content: textChatContent("bye")},
 			},
-			want: "hi\n\nbye",
+			want: "User: hi\n\nAssistant: hey\n\nUser: bye",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildPromptText(tt.messages)
+			got := buildPromptText(tt.messages, PromptCapabilities{})
 			if got != tt.want {
 				t.Errorf("got %q, want %q", got, tt.want)
 			}
@@ -116,14 +120,14 @@ func TestHandleNonStream(t *testing.T) {
 	if len(resp.Choices) != 1 {
 		t.Fatalf("choices = %d, want 1", len(resp.Choices))
 	}
-	if resp.Choices[0].Message.Content.Text != "Hello world" {
-		t.Errorf("content = %q, want %q", resp.Choices[0].Message.Content.Text, "Hello world")
+	if resp.Choices[0].Message.Content != "Hello world" {
+		t.Errorf("content = %q, want %q", resp.Choices[0].Message.Content, "Hello world")
 	}
 	if *resp.Choices[0].FinishReason != "stop" {
 		t.Errorf("finish_reason = %q, want %q", *resp.Choices[0].FinishReason, "stop")
 	}
-	if mock.gotText != "hi" {
-		t.Errorf("prompt text = %q, want %q", mock.gotText, "hi")
+	if mock.gotText != "User: hi" {
+		t.Errorf("prompt text = %q, want %q", mock.gotText, "User: hi")
 	}
 }
 
@@ -166,15 +170,15 @@ func TestHandleStream(t *testing.T) {
 	if first.Choices[0].Delta.Role != "assistant" {
 		t.Errorf("first chunk role = %q, want %q", first.Choices[0].Delta.Role, "assistant")
 	}
-	if first.Choices[0].Delta.Content.Text != "Hello" {
-		t.Errorf("first chunk content = %q, want %q", first.Choices[0].Delta.Content.Text, "Hello")
+	if first.Choices[0].Delta.Content != "Hello" {
+		t.Errorf("first chunk content = %q, want %q", first.Choices[0].Delta.Content, "Hello")
 	}
 
 	// Second chunk should have content only
 	var second ChatCompletionResponse
 	json.Unmarshal([]byte(events[1]), &second)
-	if second.Choices[0].Delta.Content.Text != " world" {
-		t.Errorf("second chunk content = %q, want %q", second.Choices[0].Delta.Content.Text, " world")
+	if second.Choices[0].Delta.Content != " world" {
+		t.Errorf("second chunk content = %q, want %q", second.Choices[0].Delta.Content, " world")
 	}
 
 	// Third chunk should have finish_reason
@@ -330,10 +334,14 @@ func TestChatContentUnmarshalEdgeCases(t *testing.T) {
 		{"null content", `null`, "", false},
 		{"empty string", `""`, "", false},
 		{"empty array", `[]`, "", false},
-		{"array with non-text type", `[{"type":"image_url","url":"http://x"}]`, "", false},
-		{"array with mixed types", `[{"type":"image_url","url":"x"},{"type":"text","text":"hi"}]`, "hi", false},
+		{"invalid image_url shape", `[{"type":"image_url","url":"http://x"}]`, "", true},
+		{"array with mixed types", `[{"type":"image_url","image_url":{"url":"x"}},{"type":"text","text":"hi"}]`, "hi", false},
 		{"multiple text parts", `[{"type":"text","text":"a"},{"type":"text","text":"b"}]`, "ab", false},
+		{"input audio part", `[{"type":"input_audio","input_audio":{"data":"abc","format":"wav"}}]`, "", false},
+		{"file part", `[{"type":"file","file":{"file_id":"file_123","filename":"note.txt"}}]`, "", false},
+		{"refusal part", `[{"type":"refusal","refusal":"cannot help"}]`, "", false},
 		{"invalid object", `{"type":"text","text":"hi"}`, "", true},
+		{"unknown part type", `[{"type":"video","url":"x"}]`, "", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -348,15 +356,15 @@ func TestChatContentUnmarshalEdgeCases(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unmarshal error: %v", err)
 			}
-			if c.Text != tt.want {
-				t.Errorf("got %q, want %q", c.Text, tt.want)
+			if c.TextValue() != tt.want {
+				t.Errorf("got %q, want %q", c.TextValue(), tt.want)
 			}
 		})
 	}
 }
 
 func TestChatContentMarshalRoundtrip(t *testing.T) {
-	c := ChatContent{Text: "hello"}
+	c := textChatContent("hello")
 	data, err := json.Marshal(c)
 	if err != nil {
 		t.Fatal(err)
@@ -523,12 +531,11 @@ func TestLogMiddlewareVerbose(t *testing.T) {
 	}
 }
 
-func TestToolCallMarshal(t *testing.T) {
-	tc := ToolCall{
-		Index:    0,
+func TestChatToolCallMarshal(t *testing.T) {
+	tc := ChatToolCall{
 		ID:       "call_1",
 		Type:     "function",
-		Function: ToolCallFunction{Name: "read", Arguments: `{"path":"main.go"}`},
+		Function: &ToolCallFunction{Name: "read", Arguments: `{"path":"main.go"}`},
 	}
 	data, err := json.Marshal(tc)
 	if err != nil {
@@ -547,14 +554,18 @@ func TestToolCallMarshal(t *testing.T) {
 }
 
 func TestToolCallInDelta(t *testing.T) {
-	msg := ChatMessage{
-		Role: "assistant",
-		ToolCalls: []ToolCall{{
-			Index:    0,
-			ID:       "call_1",
-			Type:     "function",
-			Function: ToolCallFunction{Name: "grep"},
-		}},
+	msg := struct {
+		Delta ChatCompletionDelta `json:"delta"`
+	}{
+		Delta: ChatCompletionDelta{
+			Role: "assistant",
+			ToolCalls: []ChatToolCallDelta{{
+				Index:    0,
+				ID:       "call_1",
+				Type:     "function",
+				Function: &ToolCallFunctionDelta{Name: "grep"},
+			}},
+		},
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -570,9 +581,9 @@ func TestToolCallInDelta(t *testing.T) {
 }
 
 func TestToolCallOmittedWhenEmpty(t *testing.T) {
-	msg := ChatMessage{
+	msg := ChatCompletionMessage{
 		Role:    "assistant",
-		Content: ChatContent{Text: "hello"},
+		Content: "hello",
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -608,8 +619,11 @@ func (m *mockBridgeWithToolCalls) Prompt(ctx context.Context, blocks []ContentBl
 
 func (m *mockBridgeWithToolCalls) Close() error        { return nil }
 func (m *mockBridgeWithToolCalls) Models() []ModelInfo { return nil }
-func (m *mockBridgeWithToolCalls) Usage() UsageInfo    { return UsageInfo{} }
-func (m *mockBridgeWithToolCalls) Ready() bool         { return true }
+func (m *mockBridgeWithToolCalls) PromptCapabilities() PromptCapabilities {
+	return PromptCapabilities{}
+}
+func (m *mockBridgeWithToolCalls) Usage() UsageInfo { return UsageInfo{} }
+func (m *mockBridgeWithToolCalls) Ready() bool      { return true }
 
 func TestHandleStreamWithToolCalls(t *testing.T) {
 	old := showToolAnnotations
@@ -653,10 +667,10 @@ func TestHandleStreamWithToolCalls(t *testing.T) {
 			continue
 		}
 		delta := resp.Choices[0].Delta
-		if delta != nil && strings.Contains(delta.Content.Text, "🔧") {
+		if delta != nil && strings.Contains(delta.Content, "🔧") {
 			hasToolText = true
 		}
-		if delta != nil && delta.Content.Text == "Here are the contents." {
+		if delta != nil && delta.Content == "Here are the contents." {
 			hasContentText = true
 		}
 	}
@@ -771,89 +785,102 @@ func TestMapStopReason(t *testing.T) {
 	})
 }
 
-func TestBuildPromptTextWithReplayHistory(t *testing.T) {
-	old := replayHistory
-	replayHistory = true
-	defer func() { replayHistory = old }()
-
-	t.Run("includes assistant messages", func(t *testing.T) {
-		msgs := []ChatMessage{
-			{Role: "user", Content: ChatContent{Text: "What's 2+2?"}},
-			{Role: "assistant", Content: ChatContent{Text: "4"}},
-			{Role: "user", Content: ChatContent{Text: "Times 3?"}},
-		}
-		got := buildPromptText(msgs)
-		if !strings.Contains(got, "What's 2+2?") {
-			t.Errorf("missing first user message: %q", got)
-		}
-		if !strings.Contains(got, "Assistant: 4") {
-			t.Errorf("missing assistant message: %q", got)
-		}
-		if !strings.Contains(got, "Times 3?") {
-			t.Errorf("missing second user message: %q", got)
-		}
-	})
-
-	t.Run("full conversation with system", func(t *testing.T) {
-		msgs := []ChatMessage{
-			{Role: "system", Content: ChatContent{Text: "Be helpful."}},
-			{Role: "user", Content: ChatContent{Text: "Hi"}},
-			{Role: "assistant", Content: ChatContent{Text: "Hello!"}},
-			{Role: "user", Content: ChatContent{Text: "Bye"}},
-		}
-		got := buildPromptText(msgs)
-		want := "System: Be helpful.\n\nHi\n\nAssistant: Hello!\n\nBye"
-		if got != want {
-			t.Errorf("got %q, want %q", got, want)
-		}
-	})
-
-	t.Run("disabled FF still drops assistant", func(t *testing.T) {
-		replayHistory = false
-		msgs := []ChatMessage{
-			{Role: "user", Content: ChatContent{Text: "hi"}},
-			{Role: "assistant", Content: ChatContent{Text: "hey"}},
-			{Role: "user", Content: ChatContent{Text: "bye"}},
-		}
-		got := buildPromptText(msgs)
-		if strings.Contains(got, "hey") {
-			t.Errorf("assistant message should be dropped when FF off: %q", got)
-		}
-	})
+func TestBuildPromptTextPreservesOpenAIRoles(t *testing.T) {
+	msgs := []ChatMessage{
+		{Role: "developer", Name: "planner", Content: textChatContent("Prefer concise output.")},
+		{Role: "system", Content: textChatContent("Be helpful.")},
+		{Role: "user", Content: textChatContent("Hi")},
+		{Role: "assistant", Content: textChatContent("Hello!")},
+		{Role: "tool", ToolCallID: "call_1", Content: textChatContent(`{"value":4}`)},
+	}
+	got := buildPromptText(msgs, PromptCapabilities{})
+	want := "Developer[planner]: Prefer concise output.\n\nSystem: Be helpful.\n\nUser: Hi\n\nAssistant: Hello!\n\nTool[call_1]: {\"value\":4}"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
 }
 
 func TestChatContentParsesImageURL(t *testing.T) {
-	input := `[{"type":"text","text":"What is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc123"}}]`
+	input := `[{"type":"text","text":"What is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc123"}},{"type":"text","text":"Please answer."}]`
 	var c ChatContent
 	if err := json.Unmarshal([]byte(input), &c); err != nil {
 		t.Fatal(err)
 	}
-	if c.Text != "What is this?" {
-		t.Errorf("text = %q, want %q", c.Text, "What is this?")
+	if c.TextValue() != "What is this?Please answer." {
+		t.Errorf("text = %q, want %q", c.TextValue(), "What is this?Please answer.")
 	}
-	if len(c.Images) != 1 {
-		t.Fatalf("images = %d, want 1", len(c.Images))
+	if len(c.Parts) != 3 {
+		t.Fatalf("parts = %d, want 3", len(c.Parts))
 	}
-	if c.Images[0].MimeType != "image/png" {
-		t.Errorf("mime = %q, want %q", c.Images[0].MimeType, "image/png")
+	if c.Parts[0].Type != "text" || c.Parts[0].Text != "What is this?" {
+		t.Fatalf("parts[0] = %+v", c.Parts[0])
 	}
-	if c.Images[0].Data != "abc123" {
-		t.Errorf("data = %q, want %q", c.Images[0].Data, "abc123")
+	if c.Parts[1].Type != "image_url" || c.Parts[1].ImageURL == nil {
+		t.Fatalf("parts[1] = %+v", c.Parts[1])
+	}
+	if c.Parts[2].Type != "text" || c.Parts[2].Text != "Please answer." {
+		t.Fatalf("parts[2] = %+v", c.Parts[2])
+	}
+	mimeType, decoded := parseDataURI(c.Parts[1].ImageURL.URL)
+	if mimeType != "image/png" {
+		t.Errorf("mime = %q, want %q", mimeType, "image/png")
+	}
+	if decoded != "abc123" {
+		t.Errorf("data = %q, want %q", decoded, "abc123")
+	}
+}
+
+func TestChatCompletionRequestPreservesOpenAISemantics(t *testing.T) {
+	body := `{
+		"model":"gpt-test",
+		"messages":[
+			{"role":"developer","name":"planner","content":"Prefer short answers."},
+			{"role":"assistant","content":[{"type":"refusal","refusal":"cannot help"}],"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"weather\"}"}}],"function_call":{"name":"legacy_lookup","arguments":"{\"q\":\"weather\"}"},"audio":{"id":"audio_123"}},
+			{"role":"tool","tool_call_id":"call_1","content":"{\"temp\":22}"},
+			{"role":"user","content":[{"type":"text","text":"look"},{"type":"input_audio","input_audio":{"data":"YWJj","format":"wav"}},{"type":"file","file":{"file_id":"file_123","filename":"note.txt"}}]}
+		]
+	}`
+	var req ChatCompletionRequest
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(req.Messages) != 4 {
+		t.Fatalf("messages = %d, want 4", len(req.Messages))
+	}
+	if req.Messages[0].Role != "developer" || req.Messages[0].Name != "planner" {
+		t.Fatalf("developer message = %+v", req.Messages[0])
+	}
+	if len(req.Messages[1].ToolCalls) != 1 || req.Messages[1].ToolCalls[0].ID != "call_1" {
+		t.Fatalf("assistant tool calls = %+v", req.Messages[1].ToolCalls)
+	}
+	if req.Messages[1].FunctionCall == nil || req.Messages[1].FunctionCall.Name != "legacy_lookup" {
+		t.Fatalf("assistant function call = %+v", req.Messages[1].FunctionCall)
+	}
+	if req.Messages[1].Audio == nil || req.Messages[1].Audio.ID != "audio_123" {
+		t.Fatalf("assistant audio = %+v", req.Messages[1].Audio)
+	}
+	if req.Messages[2].ToolCallID != "call_1" {
+		t.Fatalf("tool message = %+v", req.Messages[2])
+	}
+	if len(req.Messages[3].Content.Parts) != 3 {
+		t.Fatalf("user parts = %d, want 3", len(req.Messages[3].Content.Parts))
+	}
+	if req.Messages[3].Content.Parts[1].InputAudio == nil || req.Messages[3].Content.Parts[1].InputAudio.Format != "wav" {
+		t.Fatalf("input audio part = %+v", req.Messages[3].Content.Parts[1])
+	}
+	if req.Messages[3].Content.Parts[2].File == nil || req.Messages[3].Content.Parts[2].File.FileID != "file_123" {
+		t.Fatalf("file part = %+v", req.Messages[3].Content.Parts[2])
 	}
 }
 
 func TestBuildPromptBlocks(t *testing.T) {
-	old := enableImages
-	enableImages = true
-	defer func() { enableImages = old }()
-
 	msgs := []ChatMessage{
-		{Role: "user", Content: ChatContent{
-			Text:   "What is this?",
-			Images: []ImageContent{{MimeType: "image/png", Data: "abc123"}},
-		}},
+		{Role: "user", Content: ChatContent{Parts: []ChatContentPart{
+			{Type: "text", Text: "What is this?"},
+			{Type: "image_url", ImageURL: &ImageURLPart{URL: "data:image/png;base64,abc123"}},
+		}}},
 	}
-	blocks := buildPromptBlocks(msgs)
+	blocks := buildPromptBlocks(msgs, PromptCapabilities{Image: true})
 	if len(blocks) != 2 {
 		t.Fatalf("got %d blocks, want 2", len(blocks))
 	}
@@ -868,22 +895,233 @@ func TestBuildPromptBlocks(t *testing.T) {
 	}
 }
 
-func TestBuildPromptBlocksImagesDisabled(t *testing.T) {
-	old := enableImages
-	enableImages = false
-	defer func() { enableImages = old }()
-
+func TestBuildPromptBlocksPreservesConversationOrder(t *testing.T) {
 	msgs := []ChatMessage{
+		{Role: "system", Content: textChatContent("Be precise.")},
 		{Role: "user", Content: ChatContent{
-			Text:   "What is this?",
-			Images: []ImageContent{{MimeType: "image/png", Data: "abc123"}},
+			Parts: []ChatContentPart{
+				{Type: "text", Text: "Look at "},
+				{Type: "image_url", ImageURL: &ImageURLPart{URL: "data:image/png;base64,img1"}},
+				{Type: "text", Text: " then answer."},
+			},
 		}},
+		{Role: "assistant", Content: textChatContent("It is a cat.")},
+		{Role: "user", Content: textChatContent("Why?")},
 	}
-	blocks := buildPromptBlocks(msgs)
+
+	blocks := buildPromptBlocks(msgs, PromptCapabilities{Image: true})
+	if len(blocks) != 6 {
+		t.Fatalf("got %d blocks, want 6", len(blocks))
+	}
+	if blocks[0].Text != "System: Be precise." {
+		t.Fatalf("blocks[0].text = %q", blocks[0].Text)
+	}
+	if blocks[1].Text != "User: Look at " {
+		t.Fatalf("blocks[1].text = %q", blocks[1].Text)
+	}
+	if blocks[2].Type != "image" || blocks[2].Data != "img1" {
+		t.Fatalf("blocks[2] = %+v, want image img1", blocks[2])
+	}
+	if blocks[3].Text != " then answer." {
+		t.Fatalf("blocks[3].text = %q", blocks[3].Text)
+	}
+	if blocks[4].Text != "Assistant: It is a cat." {
+		t.Fatalf("blocks[4].text = %q", blocks[4].Text)
+	}
+	if blocks[5].Text != "User: Why?" {
+		t.Fatalf("blocks[5].text = %q", blocks[5].Text)
+	}
+}
+
+func TestBuildPromptBlocksImagesDisabled(t *testing.T) {
+	msgs := []ChatMessage{
+		{Role: "user", Content: ChatContent{Parts: []ChatContentPart{
+			{Type: "text", Text: "What is this?"},
+			{Type: "image_url", ImageURL: &ImageURLPart{URL: "data:image/png;base64,abc123"}},
+		}}},
+	}
+	blocks := buildPromptBlocks(msgs, PromptCapabilities{})
 	// Should only have text, no image blocks
 	for _, b := range blocks {
 		if b.Type == "image" {
 			t.Error("image blocks should not be included when FF disabled")
 		}
+	}
+}
+
+func TestBuildPromptBlocksPreservesImageOnlyRoleContext(t *testing.T) {
+	msgs := []ChatMessage{
+		{Role: "assistant", Content: ChatContent{
+			Parts: []ChatContentPart{{Type: "image_url", ImageURL: &ImageURLPart{URL: "data:image/png;base64,img1"}}},
+		}},
+	}
+
+	blocks := buildPromptBlocks(msgs, PromptCapabilities{Image: true})
+	if len(blocks) != 2 {
+		t.Fatalf("got %d blocks, want 2", len(blocks))
+	}
+	if blocks[0].Type != "text" || blocks[0].Text != "Assistant:" {
+		t.Fatalf("blocks[0] = %+v, want Assistant: header", blocks[0])
+	}
+	if blocks[1].Type != "image" || blocks[1].Data != "img1" {
+		t.Fatalf("blocks[1] = %+v, want image img1", blocks[1])
+	}
+}
+
+func TestBuildPromptBlocksMapsInputAudioToACPBlock(t *testing.T) {
+	msgs := []ChatMessage{
+		{Role: "user", Content: ChatContent{
+			Parts: []ChatContentPart{
+				{Type: "text", Text: "Listen"},
+				{Type: "input_audio", InputAudio: &InputAudioPart{Data: "YWJj", Format: "wav"}},
+			},
+		}},
+	}
+
+	blocks := buildPromptBlocks(msgs, PromptCapabilities{Audio: true})
+	if len(blocks) != 2 {
+		t.Fatalf("got %d blocks, want 2", len(blocks))
+	}
+	if blocks[0].Text != "User: Listen" {
+		t.Fatalf("blocks[0] = %+v", blocks[0])
+	}
+	if blocks[1].Type != "audio" || blocks[1].MimeType != "audio/wav" || blocks[1].Data != "YWJj" {
+		t.Fatalf("blocks[1] = %+v", blocks[1])
+	}
+}
+
+func TestBuildPromptBlocksFallsBackWhenAudioUnsupported(t *testing.T) {
+	msgs := []ChatMessage{
+		{Role: "user", Content: ChatContent{
+			Parts: []ChatContentPart{
+				{Type: "input_audio", InputAudio: &InputAudioPart{Data: "YWJj", Format: "wav"}},
+			},
+		}},
+	}
+
+	blocks := buildPromptBlocks(msgs, PromptCapabilities{})
+	if len(blocks) != 1 {
+		t.Fatalf("got %d blocks, want 1", len(blocks))
+	}
+	if blocks[0].Type != "text" || !strings.Contains(blocks[0].Text, "InputAudio:") {
+		t.Fatalf("blocks[0] = %+v", blocks[0])
+	}
+}
+
+func TestBuildPromptBlocksMapsFileDataToEmbeddedResource(t *testing.T) {
+	msgs := []ChatMessage{
+		{Role: "user", Content: ChatContent{
+			Parts: []ChatContentPart{
+				{Type: "file", File: &FileContentPart{Filename: "note.txt", FileData: "YWJj"}},
+			},
+		}},
+	}
+
+	blocks := buildPromptBlocks(msgs, PromptCapabilities{EmbeddedContext: true})
+	if len(blocks) != 2 {
+		t.Fatalf("got %d blocks, want 2", len(blocks))
+	}
+	if blocks[0].Type != "text" || blocks[0].Text != "User:" {
+		t.Fatalf("blocks[0] = %+v", blocks[0])
+	}
+	if blocks[1].Type != "resource" || blocks[1].Resource == nil {
+		t.Fatalf("blocks[1] = %+v", blocks[1])
+	}
+	if blocks[1].Resource.URI != "note.txt" {
+		t.Fatalf("resource uri = %q", blocks[1].Resource.URI)
+	}
+	if blocks[1].Resource.Text != "abc" {
+		t.Fatalf("resource text = %q", blocks[1].Resource.Text)
+	}
+	if blocks[1].Resource.Blob != "" {
+		t.Fatalf("resource blob should be empty, got %q", blocks[1].Resource.Blob)
+	}
+}
+
+func TestBuildPromptBlocksMapsBinaryFileDataToBlobResource(t *testing.T) {
+	msgs := []ChatMessage{
+		{Role: "user", Content: ChatContent{
+			Parts: []ChatContentPart{
+				{Type: "file", File: &FileContentPart{Filename: "image.png", FileData: "AAECAw=="}},
+			},
+		}},
+	}
+
+	blocks := buildPromptBlocks(msgs, PromptCapabilities{EmbeddedContext: true})
+	if len(blocks) != 2 {
+		t.Fatalf("got %d blocks, want 2", len(blocks))
+	}
+	if blocks[1].Type != "resource" || blocks[1].Resource == nil {
+		t.Fatalf("blocks[1] = %+v", blocks[1])
+	}
+	if blocks[1].Resource.URI != "image.png" {
+		t.Fatalf("resource uri = %q", blocks[1].Resource.URI)
+	}
+	if blocks[1].Resource.Blob != "AAECAw==" {
+		t.Fatalf("resource blob = %q", blocks[1].Resource.Blob)
+	}
+	if blocks[1].Resource.Text != "" {
+		t.Fatalf("resource text should be empty, got %q", blocks[1].Resource.Text)
+	}
+}
+
+func TestBuildPromptBlocksFallsBackWhenEmbeddedContextUnsupported(t *testing.T) {
+	msgs := []ChatMessage{
+		{Role: "user", Content: ChatContent{
+			Parts: []ChatContentPart{
+				{Type: "file", File: &FileContentPart{Filename: "note.txt", FileData: "YWJj"}},
+			},
+		}},
+	}
+
+	blocks := buildPromptBlocks(msgs, PromptCapabilities{})
+	if len(blocks) != 1 {
+		t.Fatalf("got %d blocks, want 1", len(blocks))
+	}
+	if blocks[0].Type != "text" || !strings.Contains(blocks[0].Text, "File:") {
+		t.Fatalf("blocks[0] = %+v", blocks[0])
+	}
+}
+
+func TestBuildPromptBlocksPreservesStructuredAssistantSemantics(t *testing.T) {
+	msgs := []ChatMessage{
+		{
+			Role:    "assistant",
+			Content: ChatContent{Parts: []ChatContentPart{{Type: "refusal", Refusal: "cannot comply"}}},
+			ToolCalls: []ChatToolCall{{
+				ID:       "call_1",
+				Type:     "function",
+				Function: &ToolCallFunction{Name: "lookup", Arguments: `{"q":"weather"}`},
+			}},
+			FunctionCall: &FunctionCall{Name: "legacy_lookup", Arguments: `{"q":"weather"}`},
+			Audio:        &AssistantAudio{ID: "audio_123"},
+		},
+	}
+
+	blocks := buildPromptBlocks(msgs, PromptCapabilities{})
+	if len(blocks) != 4 {
+		t.Fatalf("got %d blocks, want 4", len(blocks))
+	}
+	if blocks[0].Text != "Assistant: Refusal: cannot comply" {
+		t.Fatalf("blocks[0].text = %q", blocks[0].Text)
+	}
+	if !strings.Contains(blocks[1].Text, "FunctionCall:") || !strings.Contains(blocks[1].Text, "legacy_lookup") {
+		t.Fatalf("blocks[1].text = %q", blocks[1].Text)
+	}
+	if !strings.Contains(blocks[2].Text, "ToolCalls:") || !strings.Contains(blocks[2].Text, `"lookup"`) {
+		t.Fatalf("blocks[2].text = %q", blocks[2].Text)
+	}
+	if !strings.Contains(blocks[3].Text, "Audio:") || !strings.Contains(blocks[3].Text, "audio_123") {
+		t.Fatalf("blocks[3].text = %q", blocks[3].Text)
+	}
+}
+
+func TestChatContentAllowsEmptyTextPart(t *testing.T) {
+	var c ChatContent
+	if err := json.Unmarshal([]byte(`[{"type":"text","text":""}]`), &c); err != nil {
+		t.Fatalf("unmarshal empty text part: %v", err)
+	}
+	if len(c.Parts) != 1 || c.Parts[0].Type != "text" {
+		t.Fatalf("parts = %+v", c.Parts)
 	}
 }

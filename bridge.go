@@ -27,10 +27,16 @@ func mustMarshal(v any) json.RawMessage {
 type Bridge interface {
 	Prompt(ctx context.Context, blocks []ContentBlock, onEvent func(PromptEvent)) (string, error)
 	Models() []ModelInfo
+	PromptCapabilities() PromptCapabilities
 	Usage() UsageInfo
 	Ready() bool
 	Close() error
 }
+
+// PermissionDecider chooses which ACP permission option should be returned to
+// the agent when a tool call requires explicit user confirmation. A nil
+// decider means the bridge will always fall back to the default reject choice.
+type PermissionDecider func(RequestPermissionParams) RequestPermissionOutcome
 
 // UsageInfo holds the latest context usage snapshot reported by Kiro for the
 // most recent turn that completed on this bridge.
@@ -106,6 +112,7 @@ type bridge struct {
 
 	proc            *acpProcess
 	models          []ModelInfo
+	promptCaps      PromptCapabilities
 	ready           bool
 	sharedSessionID string
 	lastContextPct  float64
@@ -122,6 +129,9 @@ type BridgeConfig struct {
 	CWD     string
 	Agent   string
 	Version string
+	// PermissionDecider overrides the bridge's default permission response.
+	// When nil, session/request_permission is answered with reject_once.
+	PermissionDecider PermissionDecider
 }
 
 // acpSession is the bridge's internal handle for one ACP session plus the
@@ -159,6 +169,7 @@ type acpProcess struct {
 	pending      map[RPCID]chan *Response
 	notifHandler func(*Notification)
 	deadErr      error
+	permission   PermissionDecider
 	done         chan struct{}
 	deathOnce    sync.Once
 	waitDone     chan struct{}
@@ -167,6 +178,9 @@ type acpProcess struct {
 }
 
 func NewBridge(cfg BridgeConfig) (Bridge, error) {
+	if cfg.PermissionDecider == nil {
+		cfg.PermissionDecider = rejectPermissionDecider
+	}
 	b := &bridge{
 		cfg:         cfg,
 		sessionMode: parseSessionMode(),
@@ -181,12 +195,31 @@ func NewBridge(cfg BridgeConfig) (Bridge, error) {
 	return b, nil
 }
 
+func desiredPromptCapabilities() PromptCapabilities {
+	return PromptCapabilities{
+		Image:           true,
+		Audio:           true,
+		EmbeddedContext: true,
+	}
+}
+
+// negotiatedPromptCapabilities intersects what the bridge knows how to emit
+// with what the connected ACP agent declared during initialize.
+func negotiatedPromptCapabilities(local, remote PromptCapabilities) PromptCapabilities {
+	return PromptCapabilities{
+		Image:           local.Image && remote.Image,
+		Audio:           local.Audio && remote.Audio,
+		EmbeddedContext: local.EmbeddedContext && remote.EmbeddedContext,
+	}
+}
+
 func (b *bridge) connect() error {
-	proc, err := newACPProcess(b.cfg.CLIPath)
+	proc, err := newACPProcess(b.cfg.CLIPath, b.cfg.PermissionDecider)
 	if err != nil {
 		return fmt.Errorf("start kiro-cli: %w", err)
 	}
-	if err := b.initialize(proc); err != nil {
+	promptCaps, err := b.initialize(proc)
+	if err != nil {
 		proc.Close()
 		return fmt.Errorf("initialize: %w", err)
 	}
@@ -212,6 +245,7 @@ func (b *bridge) connect() error {
 	oldProc := b.proc
 	b.proc = proc
 	b.models = append([]ModelInfo(nil), discoverySession.models...)
+	b.promptCaps = promptCaps
 	b.ready = true
 	b.sharedSessionID = sharedSessionID
 	b.lastContextPct = 0
@@ -289,6 +323,7 @@ func (b *bridge) handleProcessExit(proc *acpProcess) {
 		return
 	}
 	b.proc = nil
+	b.promptCaps = PromptCapabilities{}
 	b.ready = false
 	b.sharedSessionID = ""
 	b.lastContextPct = 0
@@ -302,22 +337,27 @@ func (b *bridge) handleProcessExit(proc *acpProcess) {
 	}()
 }
 
-func (b *bridge) initialize(proc *acpProcess) error {
+func (b *bridge) initialize(proc *acpProcess) (PromptCapabilities, error) {
+	localCaps := desiredPromptCapabilities()
 	id := b.nextRequestID()
 	resp, err := proc.sendRequest(id, "initialize", InitializeParams{
 		ProtocolVersion: 1,
 		ClientCapabilities: ClientCapabilities{
-			PromptCapabilities: &PromptCapabilities{Image: true},
+			PromptCapabilities: &localCaps,
 		},
 		ClientInfo: ClientInfo{Name: "kiro-bridge", Title: "Kiro Bridge", Version: b.cfg.Version},
 	}, nil)
 	if err != nil {
-		return fmt.Errorf("reading initialize response: %w", err)
+		return PromptCapabilities{}, fmt.Errorf("reading initialize response: %w", err)
 	}
 	if resp.Error != nil {
-		return fmt.Errorf("initialize error: %w", resp.Error)
+		return PromptCapabilities{}, fmt.Errorf("initialize error: %w", resp.Error)
 	}
-	return nil
+	var result InitializeResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return PromptCapabilities{}, fmt.Errorf("decode initialize result: %w", err)
+	}
+	return negotiatedPromptCapabilities(localCaps, result.AgentCapabilities.PromptCapabilities), nil
 }
 
 func (b *bridge) nextRequestID() int {
@@ -420,6 +460,12 @@ func (b *bridge) Models() []ModelInfo {
 	return append([]ModelInfo(nil), b.models...)
 }
 
+func (b *bridge) PromptCapabilities() PromptCapabilities {
+	b.stateMu.RLock()
+	defer b.stateMu.RUnlock()
+	return b.promptCaps
+}
+
 func (b *bridge) Usage() UsageInfo {
 	b.stateMu.RLock()
 	pct := b.lastContextPct
@@ -455,6 +501,7 @@ func (b *bridge) Close() error {
 	close(b.stopCh)
 	proc := b.proc
 	b.proc = nil
+	b.promptCaps = PromptCapabilities{}
 	b.ready = false
 	b.sharedSessionID = ""
 	b.stateMu.Unlock()
@@ -465,7 +512,7 @@ func (b *bridge) Close() error {
 	return nil
 }
 
-func newACPProcess(cliPath string) (*acpProcess, error) {
+func newACPProcess(cliPath string, permission PermissionDecider) (*acpProcess, error) {
 	cmd := execCommand(cliPath, "acp")
 	cmd.Stderr = &stderrWriter{prefix: "[kiro-cli] "}
 
@@ -484,12 +531,13 @@ func newACPProcess(cliPath string) (*acpProcess, error) {
 	}
 
 	proc := &acpProcess{
-		cmd:      cmd,
-		stdin:    stdin,
-		reader:   bufio.NewReader(stdout),
-		pending:  make(map[RPCID]chan *Response),
-		done:     make(chan struct{}),
-		waitDone: make(chan struct{}),
+		cmd:        cmd,
+		stdin:      stdin,
+		reader:     bufio.NewReader(stdout),
+		pending:    make(map[RPCID]chan *Response),
+		permission: permission,
+		done:       make(chan struct{}),
+		waitDone:   make(chan struct{}),
 	}
 
 	go proc.readLoop()
@@ -726,12 +774,19 @@ func (p *acpProcess) processError() error {
 func (p *acpProcess) handleIncomingRequest(req *Request) {
 	switch req.Method {
 	case "session/request_permission":
-		result, _ := json.Marshal(map[string]any{
-			"outcome": map[string]any{
-				"outcome":  "selected",
-				"optionId": "reject_once",
-			},
-		})
+		var params RequestPermissionParams
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			debugf("debug: failed to parse permission request: %v", err)
+		}
+		outcome := defaultPermissionOutcome(params.Options)
+		if p.permission != nil {
+			outcome = normalizePermissionOutcome(params.Options, p.permission(params))
+		}
+		result, err := json.Marshal(RequestPermissionResult{Outcome: outcome})
+		if err != nil {
+			debugf("debug: failed to marshal permission result: %v", err)
+			return
+		}
 		data, err := newResponse(req.ID, result)
 		if err != nil {
 			debugf("debug: failed to marshal permission response: %v", err)
@@ -746,6 +801,36 @@ func (p *acpProcess) handleIncomingRequest(req *Request) {
 		}
 		_ = p.writeLine(data)
 	}
+}
+
+func defaultPermissionOutcome(options []PermissionOption) RequestPermissionOutcome {
+	for _, option := range options {
+		if option.OptionID == "reject_once" {
+			return RequestPermissionOutcome{Outcome: "selected", OptionID: option.OptionID}
+		}
+	}
+	if len(options) > 0 {
+		return RequestPermissionOutcome{Outcome: "selected", OptionID: options[0].OptionID}
+	}
+	return RequestPermissionOutcome{Outcome: "selected", OptionID: "reject_once"}
+}
+
+func normalizePermissionOutcome(options []PermissionOption, outcome RequestPermissionOutcome) RequestPermissionOutcome {
+	if outcome.Outcome == "cancelled" {
+		return RequestPermissionOutcome{Outcome: "cancelled"}
+	}
+	for _, option := range options {
+		if option.OptionID == outcome.OptionID {
+			return RequestPermissionOutcome{Outcome: "selected", OptionID: option.OptionID}
+		}
+	}
+	return defaultPermissionOutcome(options)
+}
+
+// rejectPermissionDecider keeps the HTTP bridge deterministic: unless a caller
+// explicitly injects a different policy, ACP permission requests are denied.
+func rejectPermissionDecider(params RequestPermissionParams) RequestPermissionOutcome {
+	return defaultPermissionOutcome(params.Options)
 }
 
 func (p *acpProcess) Close() error {

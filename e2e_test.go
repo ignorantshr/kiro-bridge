@@ -90,8 +90,8 @@ func TestE2EStreamResponse(t *testing.T) {
 			if chunk.Choices[0].Delta.Role == "assistant" {
 				firstHasRole = true
 			}
-			if chunk.Choices[0].Delta.Content.Text != "" {
-				chunks = append(chunks, chunk.Choices[0].Delta.Content.Text)
+			if chunk.Choices[0].Delta.Content != "" {
+				chunks = append(chunks, chunk.Choices[0].Delta.Content)
 			}
 		}
 	}
@@ -154,9 +154,9 @@ func TestE2ENonStreamResponse(t *testing.T) {
 	if result.Choices[0].Message == nil {
 		t.Fatal("message is nil")
 	}
-	if result.Choices[0].Message.Content.Text == "" {
+	if result.Choices[0].Message.Content == "" {
 		t.Error("empty response content")
 	}
 
-	t.Logf("response: %s", result.Choices[0].Message.Content.Text)
+	t.Logf("response: %s", result.Choices[0].Message.Content)
 }

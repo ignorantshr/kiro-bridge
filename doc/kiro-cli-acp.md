@@ -6,7 +6,9 @@
 
 > Run Kiro CLI as an ACP-compliant agent for programmatic client integration
 
-Kiro CLI implements the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/get-started/introduction), an open standard that enables AI agents to work with any compatible editor. This means you can use Kiro's agentic capabilities in JetBrains IDEs, Zed, and other ACP-compatible editors.
+Kiro CLI implements the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/get-started/introduction), an open standard that enables AI agents to work with any compatible editor. The ACP v1 schema reference is https://agentclientprotocol.com/protocol/v1/schema. This means you can use Kiro's agentic capabilities in JetBrains IDEs, Zed, and other ACP-compatible editors.
+
+Note: this file is a copied reference. When the published ACP schema/docs and observed `kiro-cli acp` behavior differ, this project follows the CLI implementation.
 
 ## What is ACP?
 

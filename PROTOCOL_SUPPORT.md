@@ -2,6 +2,10 @@
 
 Current translation coverage between OpenAI Chat Completions API and ACP (Agent Client Protocol) over JSON-RPC 2.0.
 
+Reference schema: https://agentclientprotocol.com/protocol/v1/schema
+
+Implementation note: `kiro-cli` behavior is treated as the source of truth when it diverges from the published ACP schema. In particular, this bridge sends `session/prompt` with `params.prompt` because that is what current `kiro-cli acp` accepts in practice.
+
 Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handling | — Not applicable
 
 ## OpenAI Chat Completions → ACP
@@ -11,7 +15,7 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 | Field | Status | Notes |
 |-------|--------|-------|
 | `model` | ⚠️ | Echoed in response. Not forwarded to ACP — Kiro selects model internally. |
-| `messages` | ⚠️ | System + user + assistant flattened to prompt. Assistant included when `KIRO_BRIDGE_REPLAY_HISTORY` enabled. |
+| `messages` | ⚠️ | Parsed according to the OpenAI Chat Completions message/content schema, then projected into an ordered ACP transcript. |
 | `stream` | ✅ | Maps to SSE via ACP session notifications. |
 | `temperature` | ❌ | No ACP equivalent. Silently ignored. |
 | `top_p` | ❌ | No ACP equivalent. Silently ignored. |
@@ -29,19 +33,21 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 
 | Type | Status | Notes |
 |------|--------|-------|
-| `system` | ⚠️ | Prepended as "System: " text. Loses role structure. |
+| `system` | ⚠️ | Emitted in order as text blocks prefixed with "System: ". Loses native role structure but keeps relative position. |
 | `user` (string) | ✅ | Direct mapping. |
-| `user` (content array) | ⚠️ | Text parts extracted. `image_url` parts are parsed separately and forwarded when `KIRO_BRIDGE_ENABLE_IMAGES` is set; other non-text parts are dropped. |
-| `assistant` | ⚠️ | Flattened into prompt text when `KIRO_BRIDGE_REPLAY_HISTORY` is enabled; otherwise dropped. |
-| `tool` | ❌ | Dropped. ACP tools execute server-side. |
+| `user` (content array) | ⚠️ | Preserved in original part order. `image_url` can become ACP image blocks; `input_audio` can become ACP audio blocks when negotiated; `file` can become embedded ACP resources when negotiated and inline file data is present. |
+| `assistant` | ⚠️ | Preserved in order, including text content and assistant-specific metadata such as tool calls, then projected into ACP blocks. |
+| `tool` | ⚠️ | Preserved in order as tagged text blocks, but not translated into ACP's native tool protocol. |
 
 ### Content parts
 
 | Type | Status | Notes |
 |------|--------|-------|
-| `text` | ✅ | Direct mapping to ACP text ContentBlock. |
-| `image_url` | ⚠️ | Parsed and forwarded as ACP image block when `KIRO_BRIDGE_ENABLE_IMAGES` set. |
-| `input_audio` | ❌ | Kiro declares `audio: false`. |
+| `text` | ✅ | Mapped to ACP text ContentBlock in original part order. |
+| `image_url` | ⚠️ | Parsed and forwarded as ACP image block in original part order when the negotiated prompt capabilities include image. |
+| `input_audio` | ⚠️ | Mapped to ACP `audio` when the negotiated prompt capabilities include audio and the OpenAI format is supported (`wav`, `mp3`); otherwise falls back to structured text. |
+| `file` | ⚠️ | Mapped to ACP embedded `resource` when negotiated prompt capabilities include embedded context and the OpenAI part includes `file_data`; UTF-8 text payloads become `TextResourceContents`, other payloads become `BlobResourceContents`. |
+| `refusal` | ⚠️ | Preserved as tagged assistant text. |
 
 ### Response fields
 
@@ -73,11 +79,11 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 
 | Method | Status | Notes |
 |--------|--------|-------|
-| `initialize` | ✅ | Declares promptCapabilities.image. |
+| `initialize` | ✅ | Declares schema-aligned `promptCapabilities`; effective prompt block emission is gated by the capabilities negotiated back by `kiro-cli`. |
 | `authenticate` | ❌ | Not needed — kiro-cli handles auth. |
 | `session/new` | ✅ | Creates session with CWD. Parses models from response. |
 | `session/load` | ✅ | Implemented internally for ACP session management and tests; not exposed as HTTP API. |
-| `session/prompt` | ✅ | Sends `params.content` with text content blocks and optional image blocks when `KIRO_BRIDGE_ENABLE_IMAGES` is enabled. |
+| `session/prompt` | ✅ | Sends `params.prompt` with text content blocks plus any negotiated native image/audio/resource blocks. |
 | `session/set_mode` | ✅ | Activates agent config. |
 | `session/list` | ❌ | Not implemented. |
 
@@ -91,7 +97,7 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 
 | Method | Status | Notes |
 |--------|--------|-------|
-| `session/request_permission` | ✅ | Responds with `reject_once`. |
+| `session/request_permission` | ✅ | Answered with `reject_once` by default unless the bridge is embedded with a custom `PermissionDecider`. |
 | `fs/read_text_file` | ❌ | Not implemented. |
 | `fs/write_text_file` | ❌ | Not implemented. |
 | `terminal/create` | ❌ | Out of scope. |
@@ -119,10 +125,10 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 | Type | Status | Notes |
 |------|--------|-------|
 | `text` | ✅ | |
-| `image` | ⚠️ | Forwarded in prompts when `KIRO_BRIDGE_ENABLE_IMAGES` is enabled. ACP image responses are not surfaced. |
-| `audio` | ❌ | Kiro declares unsupported. |
-| `resource` (embedded) | ❌ | Kiro declares unsupported. |
-| `resource_link` | ❌ | Not handled. |
+| `image` | ⚠️ | Forwarded in prompts when the negotiated prompt capabilities include image. ACP image responses are not surfaced. |
+| `audio` | ⚠️ | Emitted for OpenAI `input_audio` parts when the negotiated prompt capabilities include audio. |
+| `resource` (embedded) | ⚠️ | Emitted for OpenAI file parts with inline `file_data` when the negotiated prompt capabilities include embedded context. Text files become embedded text resources; binary files become embedded blob resources. |
+| `resource_link` | ❌ | Defined by ACP, but the bridge does not currently emit or consume resource links. |
 
 ### Stop reasons
 

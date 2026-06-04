@@ -1,8 +1,8 @@
 {
   "name": "kiro-bridge",
-  "description": "Headless agent for kiro-bridge, read-only tools pre-approved",
-  "model": "auto",
-  "tools": ["fs_read", "grep", "glob", "web_search"],
-  "allowedTools": ["fs_read", "grep", "glob", "web_search"],
+  "description": "Headless agent for kiro-bridge",
+  "model": "glm-5",
+  "tools": ["*"],
+  "allowedTools": ["@builtin"],
   "resources": []
 }
