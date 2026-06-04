@@ -100,7 +100,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		b := holder.Get()
-		if b == nil {
+		if b == nil || !b.Ready() {
 			http.Error(w, "bridge not ready", http.StatusServiceUnavailable)
 			return
 		}
@@ -108,7 +108,7 @@ func main() {
 	})
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
 		b := holder.Get()
-		if b == nil {
+		if b == nil || !b.Ready() {
 			// Return fallback model when bridge not ready
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"object":"list","data":[{"id":"kiro","object":"model","owned_by":"kiro-bridge"}]}`))
@@ -170,7 +170,8 @@ func handleModels(b Bridge) http.HandlerFunc {
 
 func handleHealthz(holder *bridgeHolder) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if holder.Get() == nil {
+		b := holder.Get()
+		if b == nil || !b.Ready() {
 			http.Error(w, "bridge not ready", http.StatusServiceUnavailable)
 			return
 		}

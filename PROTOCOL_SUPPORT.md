@@ -12,7 +12,7 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 |-------|--------|-------|
 | `model` | ⚠️ | Echoed in response. Not forwarded to ACP — Kiro selects model internally. |
 | `messages` | ⚠️ | System + user + assistant flattened to prompt. Assistant included when `KIRO_BRIDGE_REPLAY_HISTORY` enabled. |
-| `stream` | ✅ | Maps to SSE via `session/update` notifications. |
+| `stream` | ✅ | Maps to SSE via ACP session notifications. |
 | `temperature` | ❌ | No ACP equivalent. Silently ignored. |
 | `top_p` | ❌ | No ACP equivalent. Silently ignored. |
 | `max_tokens` | ❌ | No ACP equivalent. Silently ignored. |
@@ -76,8 +76,8 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 | `initialize` | ✅ | Declares promptCapabilities.image. |
 | `authenticate` | ❌ | Not needed — kiro-cli handles auth. |
 | `session/new` | ✅ | Creates session with CWD. Parses models from response. |
-| `session/load` | ❌ | Not implemented. Kiro declares `loadSession: true`. |
-| `session/prompt` | ✅ | Sends text content blocks and optional image blocks when `KIRO_BRIDGE_ENABLE_IMAGES` is enabled. |
+| `session/load` | ✅ | Implemented internally for ACP session management and tests; not exposed as HTTP API. |
+| `session/prompt` | ✅ | Sends `params.content` with text content blocks and optional image blocks when `KIRO_BRIDGE_ENABLE_IMAGES` is enabled. |
 | `session/set_mode` | ✅ | Activates agent config. |
 | `session/list` | ❌ | Not implemented. |
 
@@ -85,7 +85,7 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 
 | Notification | Status | Notes |
 |-------------|--------|-------|
-| `session/cancel` | ✅ | Sends cancel notification. Suppresses subsequent abort error (Zed pattern). |
+| `session/cancel` | ✅ | Sent when the HTTP request context is cancelled. |
 
 ### Client methods (agent → client)
 
@@ -104,9 +104,10 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 
 | Subtype | Status | Notes |
 |---------|--------|-------|
-| `agent_message_chunk` | ✅ | Streamed as SSE text content. |
-| `tool_call` | ⚠️ | Parsed. Text annotation behind `KIRO_BRIDGE_SHOW_TOOLS`. |
-| `tool_call_update` | ⚠️ | Parsed. Not surfaced to client. |
+| `agent_message_chunk` / `AgentMessageChunk` | ✅ | Streamed as SSE text content. |
+| `tool_call` / `ToolCall` | ⚠️ | Parsed. Text annotation behind `KIRO_BRIDGE_SHOW_TOOLS`. |
+| `tool_call_update` / `ToolCallUpdate` | ⚠️ | Parsed. Not surfaced to client. |
+| `turn_end` / `TurnEnd` | ✅ | Parsed. Preferred source for final stop reason. |
 | `plan` | ❌ | Dropped. Never observed from Kiro. |
 | `thought_message_chunk` | ❌ | Dropped. Never observed from Kiro. |
 | `user_message_chunk` | ❌ | Dropped. |
@@ -152,7 +153,7 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 |---------|--------|-------|
 | Request/response | ✅ | |
 | Notifications (send) | ✅ | `session/cancel` sent on cancel. |
-| Notifications (receive) | ✅ | `session/update` handled. |
+| Notifications (receive) | ✅ | `session/update` and `session/notification` handled. |
 | Error object (code + message + data) | ✅ | |
 | ID as integer | ✅ | Used for bridge → agent requests. |
 | ID as string | ✅ | Handled for agent → client requests. |
@@ -161,7 +162,7 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 
 ## Actionable gaps (priority order)
 
-No remaining protocol gaps. All translatable features are implemented (some behind feature flags).
+No remaining protocol gaps for the current HTTP surface. `session/load` is implemented internally but not exposed as a public HTTP session API by design.
 
 ## Known limitations
 

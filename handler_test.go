@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -17,7 +18,7 @@ type mockBridge struct {
 	promptErrAfterChunks bool
 }
 
-func (m *mockBridge) Prompt(blocks []ContentBlock, onEvent func(PromptEvent)) (string, error) {
+func (m *mockBridge) Prompt(ctx context.Context, blocks []ContentBlock, onEvent func(PromptEvent)) (string, error) {
 	if len(blocks) > 0 {
 		m.gotText = blocks[0].Text
 	}
@@ -33,10 +34,10 @@ func (m *mockBridge) Prompt(blocks []ContentBlock, onEvent func(PromptEvent)) (s
 	return "end_turn", nil
 }
 
-func (m *mockBridge) Close() error       { return nil }
-func (m *mockBridge) Cancel()             {}
+func (m *mockBridge) Close() error        { return nil }
 func (m *mockBridge) Models() []ModelInfo { return nil }
 func (m *mockBridge) Usage() UsageInfo    { return UsageInfo{} }
+func (m *mockBridge) Ready() bool         { return true }
 
 func TestBuildPromptTextWithContentParts(t *testing.T) {
 	body := `{"messages":[{"role":"system","content":"Be helpful."},{"role":"user","content":[{"type":"text","text":"hello"}]}],"model":"kiro","stream":true}`
@@ -186,6 +187,71 @@ func TestHandleStream(t *testing.T) {
 	// Last should be [DONE]
 	if events[3] != "[DONE]" {
 		t.Errorf("last event = %q, want %q", events[3], "[DONE]")
+	}
+}
+
+func TestHandleStreamReturnsHTTPErrorBeforeFirstChunk(t *testing.T) {
+	mock := &mockBridge{promptErr: errBridgeNotReady}
+	handler := handleChatCompletions(mock)
+
+	body := `{"model":"kiro","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "bridge not ready") {
+		t.Fatalf("body = %q, want bridge not ready", w.Body.String())
+	}
+}
+
+func TestHandleStreamTerminatesWithSSEErrorAfterChunks(t *testing.T) {
+	mock := &mockBridge{
+		chunks:               []string{"Hello"},
+		promptErr:            errBridgeNotReady,
+		promptErrAfterChunks: true,
+	}
+	handler := handleChatCompletions(mock)
+
+	body := `{"model":"kiro","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	handler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "bridge not ready") {
+		t.Fatalf("unexpected http error body in SSE response: %s", w.Body.String())
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(w.Body.String()))
+	var events []string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "data: ") {
+			events = append(events, strings.TrimPrefix(line, "data: "))
+		}
+	}
+	if len(events) != 3 {
+		t.Fatalf("events = %d, want 3; got:\n%s", len(events), w.Body.String())
+	}
+
+	var final ChatCompletionResponse
+	if err := json.Unmarshal([]byte(events[1]), &final); err != nil {
+		t.Fatalf("unmarshal final chunk: %v", err)
+	}
+	if *final.Choices[0].FinishReason != "error" {
+		t.Fatalf("finish_reason = %q, want error", *final.Choices[0].FinishReason)
+	}
+	if events[2] != "[DONE]" {
+		t.Fatalf("last event = %q, want [DONE]", events[2])
 	}
 }
 
@@ -521,7 +587,7 @@ type mockBridgeWithToolCalls struct {
 	gotText string
 }
 
-func (m *mockBridgeWithToolCalls) Prompt(blocks []ContentBlock, onEvent func(PromptEvent)) (string, error) {
+func (m *mockBridgeWithToolCalls) Prompt(ctx context.Context, blocks []ContentBlock, onEvent func(PromptEvent)) (string, error) {
 	if len(blocks) > 0 {
 		m.gotText = blocks[0].Text
 	}
@@ -540,10 +606,10 @@ func (m *mockBridgeWithToolCalls) Prompt(blocks []ContentBlock, onEvent func(Pro
 	return "end_turn", nil
 }
 
-func (m *mockBridgeWithToolCalls) Close() error       { return nil }
-func (m *mockBridgeWithToolCalls) Cancel()             {}
+func (m *mockBridgeWithToolCalls) Close() error        { return nil }
 func (m *mockBridgeWithToolCalls) Models() []ModelInfo { return nil }
 func (m *mockBridgeWithToolCalls) Usage() UsageInfo    { return UsageInfo{} }
+func (m *mockBridgeWithToolCalls) Ready() bool         { return true }
 
 func TestHandleStreamWithToolCalls(t *testing.T) {
 	old := showToolAnnotations

@@ -96,8 +96,8 @@ providers:
 - **Tool transparency** — Kiro's tools (file search, grep, web search) run inside the ACP session with optional annotations
 - **Conversation replay** — include assistant message history for multi-turn context (experimental)
 - **Token usage estimation** — approximate token counts from Kiro's context usage metadata
-- **Health endpoint** — `GET /healthz` for monitoring
-- **Resilient** — exponential backoff on startup, session reconnect after repeated errors, graceful cancellation
+- **Health endpoint** — `GET /healthz` reports ACP process readiness
+- **Resilient** — supervised `kiro-cli` restarts, per-request session isolation by default, graceful cancellation
 
 > **Tool permissions:** Kiro requests permission for write/edit tools. The bridge rejects these by default. To allow writes, add the tools to `allowedTools` in your agent config so Kiro pre-approves them without asking.
 
@@ -116,7 +116,7 @@ All configuration is via environment variables:
 | `KIRO_BRIDGE_SHOW_TOOLS` | unset | Set to show tool call annotations in responses (experimental) |
 | `KIRO_BRIDGE_REPLAY_HISTORY` | unset | Set to include assistant messages in prompt for conversation replay (experimental) |
 | `KIRO_BRIDGE_ENABLE_IMAGES` | unset | Set to forward image content from OpenAI requests to ACP (experimental) |
-| `KIRO_BRIDGE_RESET_SESSION` | unset | Set to create a fresh ACP session after each request to avoid history accumulation |
+| `KIRO_BRIDGE_SESSION_MODE` | `per_request` | ACP session strategy: `per_request` creates a new session for each HTTP request, `shared` reuses one session |
 | `KIRO_BRIDGE_ALL_IP` | unset | Set to bind the HTTP server to `0.0.0.0` instead of `127.0.0.1` |
 | `KIRO_BRIDGE_CONTEXT_WINDOW` | `200000` | Context window size for token usage estimation |
 
@@ -194,11 +194,12 @@ git push origin "$(git branch --show-current)" --tags
 ## How it works
 
 - The bridge spawns `kiro-cli acp` as a child process and communicates via JSON-RPC over stdio.
-- On startup failure, it retries with exponential backoff (1s→60s cap) instead of crashing. The HTTP server starts immediately and returns 503 while connecting.
-- It creates one ACP session at startup and reuses it for subsequent requests.
-- Incoming OpenAI `/v1/chat/completions` requests are translated to ACP `session/prompt` calls.
-- ACP `agent_message_chunk` notifications are streamed back as OpenAI SSE chunks.
+- On startup failure or child-process exit, it retries with exponential backoff (1s→60s cap) instead of crashing. The HTTP server starts immediately and returns 503 while connecting or reconnecting.
+- It keeps one supervised ACP process alive and, by default, creates a fresh ACP session for each HTTP request. Set `KIRO_BRIDGE_SESSION_MODE=shared` to reuse a single ACP session instead.
+- Incoming OpenAI `/v1/chat/completions` requests are translated to ACP `session/prompt` calls using `params.content`.
+- ACP `agent_message_chunk` / `AgentMessageChunk` notifications are streamed back as OpenAI SSE chunks, and `TurnEnd` is used when available to determine the final stop reason.
 - Kiro tool calls (file search, web fetch, etc.) happen transparently inside the ACP session — only the final text response is returned to the client.
+- When the HTTP client disconnects or times out, the bridge forwards `session/cancel` to ACP.
 - When Kiro requests permission for write tools, the bridge rejects by default. Pre-approved tools in the agent config bypass this.
 - System and user messages from the current request are flattened into a single prompt; assistant messages are also included when `KIRO_BRIDGE_REPLAY_HISTORY` is enabled.
 - OpenAI `image_url` content is forwarded as ACP image blocks when `KIRO_BRIDGE_ENABLE_IMAGES` is enabled.

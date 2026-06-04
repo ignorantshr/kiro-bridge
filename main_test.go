@@ -124,7 +124,7 @@ func TestHandlerReturns503WhenBridgeNil(t *testing.T) {
 
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		b := holder.Get()
-		if b == nil {
+		if b == nil || !b.Ready() {
 			http.Error(w, "bridge not ready", http.StatusServiceUnavailable)
 			return
 		}

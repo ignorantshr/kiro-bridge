@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -49,7 +51,6 @@ var maxBodyBytes int64 = 1 << 20 // 1MB default
 var showToolAnnotations = os.Getenv("KIRO_BRIDGE_SHOW_TOOLS") != ""
 var replayHistory = os.Getenv("KIRO_BRIDGE_REPLAY_HISTORY") != ""
 var enableImages = os.Getenv("KIRO_BRIDGE_ENABLE_IMAGES") != ""
-var resetSession = os.Getenv("KIRO_BRIDGE_RESET_SESSION") != ""
 var allIP = os.Getenv("KIRO_BRIDGE_ALL_IP") != ""
 
 func init() {
@@ -68,6 +69,10 @@ func handleChatCompletions(b Bridge) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !b.Ready() {
+			http.Error(w, "bridge not ready", http.StatusServiceUnavailable)
 			return
 		}
 
@@ -97,18 +102,9 @@ func handleChatCompletions(b Bridge) http.HandlerFunc {
 		debugf("prompt: stream=%v model=%q len=%d", req.Stream, model, len(promptText))
 
 		if req.Stream {
-			handleStream(w, b, promptBlocks, completionID, created, model)
+			handleStream(r.Context(), w, b, promptBlocks, completionID, created, model)
 		} else {
-			handleNonStream(w, b, promptBlocks, completionID, created, model)
-		}
-
-		// Reset session to avoid history accumulation
-		if resetSession {
-			if rb, ok := b.(interface{ ResetSession() error }); ok {
-				if err := rb.ResetSession(); err != nil {
-					log.Printf("warning: failed to reset session: %v", err)
-				}
-			}
+			handleNonStream(r.Context(), w, b, promptBlocks, completionID, created, model)
 		}
 	}
 }
@@ -135,7 +131,7 @@ func writeStreamTerminal(w http.ResponseWriter, flusher http.Flusher, id string,
 	flusher.Flush()
 }
 
-func handleStream(w http.ResponseWriter, b Bridge, prompt []ContentBlock, id string, created int64, model string) {
+func handleStream(ctx context.Context, w http.ResponseWriter, b Bridge, prompt []ContentBlock, id string, created int64, model string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
@@ -147,7 +143,8 @@ func handleStream(w http.ResponseWriter, b Bridge, prompt []ContentBlock, id str
 	w.Header().Set("Connection", "keep-alive")
 
 	first := true
-	stopReason, err := b.Prompt(prompt, func(ev PromptEvent) {
+	streamStarted := false
+	stopReason, err := b.Prompt(ctx, prompt, func(ev PromptEvent) {
 		var delta *ChatMessage
 		switch ev.Type {
 		case EventText:
@@ -176,13 +173,24 @@ func handleStream(w http.ResponseWriter, b Bridge, prompt []ContentBlock, id str
 			log.Printf("error: marshal chunk: %v", err)
 			return
 		}
-		fmt.Fprintf(w, "data: %s\n\n", data)
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+			log.Printf("error: write chunk: %v", err)
+			return
+		}
+		streamStarted = true
 		flusher.Flush()
 	})
 
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return
+		}
+		if !streamStarted && errors.Is(err, errBridgeNotReady) {
+			http.Error(w, "bridge not ready", http.StatusServiceUnavailable)
+			return
+		}
 		log.Printf("error: prompt failed: %v", err)
-		if first {
+		if !streamStarted && first {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
@@ -193,14 +201,21 @@ func handleStream(w http.ResponseWriter, b Bridge, prompt []ContentBlock, id str
 	writeStreamTerminal(w, flusher, id, created, model, mapStopReason(stopReason))
 }
 
-func handleNonStream(w http.ResponseWriter, b Bridge, prompt []ContentBlock, id string, created int64, model string) {
+func handleNonStream(ctx context.Context, w http.ResponseWriter, b Bridge, prompt []ContentBlock, id string, created int64, model string) {
 	var full strings.Builder
-	stopReason, err := b.Prompt(prompt, func(ev PromptEvent) {
+	stopReason, err := b.Prompt(ctx, prompt, func(ev PromptEvent) {
 		if ev.Type == EventText {
 			full.WriteString(ev.Text)
 		}
 	})
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return
+		}
+		if errors.Is(err, errBridgeNotReady) {
+			http.Error(w, "bridge not ready", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}

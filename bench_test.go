@@ -50,7 +50,7 @@ func BenchmarkHandleStream(b *testing.B) {
 func BenchmarkNewRequest(b *testing.B) {
 	params := SessionPromptParams{
 		SessionID: "test-session",
-		Prompt:    []ContentBlock{{Type: "text", Text: "what is 2+2?"}},
+		Content:   []ContentBlock{{Type: "text", Text: "what is 2+2?"}},
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

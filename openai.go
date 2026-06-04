@@ -8,12 +8,16 @@ import (
 
 // OpenAI Chat Completions API types
 
+// ChatCompletionRequest is the subset of the OpenAI chat completions request
+// shape that the bridge accepts and translates into ACP turns.
 type ChatCompletionRequest struct {
 	Model    string        `json:"model"`
 	Messages []ChatMessage `json:"messages"`
 	Stream   bool          `json:"stream,omitempty"`
 }
 
+// ChatMessage is the bridge's normalized representation of an OpenAI message,
+// including optional tool-call metadata for response encoding.
 type ChatMessage struct {
 	Role      string      `json:"role,omitempty"`
 	Content   ChatContent `json:"content"`
@@ -38,6 +42,8 @@ type ChatContent struct {
 	Images []ImageContent
 }
 
+// ImageContent stores one parsed image payload that can be forwarded as an ACP
+// image content block when image support is enabled.
 type ImageContent struct {
 	MimeType string
 	Data     string
@@ -105,6 +111,8 @@ func (c ChatContent) MarshalJSON() ([]byte, error) {
 	return json.Marshal(c.Text)
 }
 
+// ChatCompletionResponse is used for both non-streaming responses and SSE
+// chunks, mirroring the OpenAI chat completions response envelope.
 type ChatCompletionResponse struct {
 	ID      string          `json:"id"`
 	Object  string          `json:"object"`
@@ -114,12 +122,15 @@ type ChatCompletionResponse struct {
 	Usage   *ChatUsage      `json:"usage,omitempty"`
 }
 
+// ChatUsage carries the token accounting exposed back to the OpenAI client.
 type ChatUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
 }
 
+// ChatChoice models either a final assistant message or an incremental stream
+// delta depending on which fields are populated.
 type ChatChoice struct {
 	Index        int          `json:"index"`
 	Message      *ChatMessage `json:"message,omitempty"`

@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -48,9 +50,29 @@ func TestBridgeHelperProcess(t *testing.T) {
 	}
 
 	mode := os.Getenv("KIRO_BRIDGE_HELPER_MODE")
+	countFile := os.Getenv("KIRO_BRIDGE_HELPER_COUNT_FILE")
 	scanner := bufio.NewScanner(os.Stdin)
 	writer := bufio.NewWriter(os.Stdout)
 	sessionCount := 0
+	promptCount := 0
+	appendCount := func(value string) {
+		if countFile == "" {
+			return
+		}
+		f, err := os.OpenFile(countFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		if _, err := f.WriteString(value + "\n"); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		if err := f.Close(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+	}
 
 	for scanner.Scan() {
 		var req Request
@@ -71,6 +93,16 @@ func TestBridgeHelperProcess(t *testing.T) {
 			}
 		case "session/new":
 			sessionCount++
+			if mode == "session-ids" {
+				resp = map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"result": map[string]any{
+						"sessionId": fmt.Sprintf("sess-%d", sessionCount),
+					},
+				}
+				break
+			}
 			if mode == "with-models" {
 				resp = map[string]any{
 					"jsonrpc": "2.0",
@@ -112,7 +144,70 @@ func TestBridgeHelperProcess(t *testing.T) {
 				"id":      req.ID,
 				"result":  map[string]any{},
 			}
+		case "session/load":
+			resp = map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req.ID,
+				"result": map[string]any{
+					"sessionId": "loaded-session",
+				},
+			}
+		case "session/cancel":
+			appendCount("cancel")
+			continue
 		case "session/prompt":
+			promptCount++
+			if mode == "crash-on-prompt" {
+				os.Exit(1)
+			}
+			if mode == "content-field" {
+				var params map[string]json.RawMessage
+				if err := json.Unmarshal(req.Params, &params); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(2)
+				}
+				if _, ok := params["content"]; !ok {
+					fmt.Fprintln(os.Stderr, "missing content field")
+					os.Exit(2)
+				}
+				if _, ok := params["prompt"]; ok {
+					fmt.Fprintln(os.Stderr, "unexpected prompt field")
+					os.Exit(2)
+				}
+				resp = map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"result":  map[string]any{"stopReason": "end_turn"},
+				}
+				break
+			}
+			if mode == "session-ids" {
+				var params SessionPromptParams
+				if err := json.Unmarshal(req.Params, &params); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(2)
+				}
+				chunk := map[string]any{
+					"jsonrpc": "2.0",
+					"method":  "session/update",
+					"params": map[string]any{
+						"sessionId": params.SessionID,
+						"update": map[string]any{
+							"sessionUpdate": "agent_message_chunk",
+							"content":       map[string]any{"type": "text", "text": params.SessionID},
+						},
+					},
+				}
+				d, _ := json.Marshal(chunk)
+				writer.Write(append(d, '\n'))
+				writer.Flush()
+				resp = map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"result":  map[string]any{"stopReason": "end_turn"},
+				}
+				break
+			}
 			if mode == "with-metadata" {
 				chunk := map[string]any{
 					"jsonrpc": "2.0",
@@ -149,7 +244,7 @@ func TestBridgeHelperProcess(t *testing.T) {
 				break
 			}
 			if mode == "error-then-ok" {
-				if sessionCount <= 1 {
+				if promptCount <= 3 {
 					resp = map[string]any{
 						"jsonrpc": "2.0",
 						"id":      req.ID,
@@ -169,6 +264,28 @@ func TestBridgeHelperProcess(t *testing.T) {
 					},
 				}
 				d, _ := json.Marshal(chunk)
+				writer.Write(append(d, '\n'))
+				writer.Flush()
+				resp = map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"result":  map[string]any{"stopReason": "end_turn"},
+				}
+				break
+			}
+			if mode == "turn-end" {
+				turnEnd := map[string]any{
+					"jsonrpc": "2.0",
+					"method":  "session/notification",
+					"params": map[string]any{
+						"sessionId": "sess-1",
+						"update": map[string]any{
+							"sessionUpdate": "TurnEnd",
+							"stopReason":    "max_tokens",
+						},
+					},
+				}
+				d, _ := json.Marshal(turnEnd)
 				writer.Write(append(d, '\n'))
 				writer.Flush()
 				resp = map[string]any{
@@ -205,6 +322,60 @@ func TestBridgeHelperProcess(t *testing.T) {
 					}
 				}
 				break
+			}
+			if mode == "cancel-hangs" {
+				chunk := map[string]any{
+					"jsonrpc": "2.0",
+					"method":  "session/update",
+					"params": map[string]any{
+						"sessionId": "sess-1",
+						"update": map[string]any{
+							"sessionUpdate": "agent_message_chunk",
+							"content":       map[string]any{"type": "text", "text": "working..."},
+						},
+					},
+				}
+				d, _ := json.Marshal(chunk)
+				writer.Write(append(d, '\n'))
+				writer.Flush()
+				continue
+			}
+			if mode == "response-shuffle" {
+				extra := map[string]any{
+					"jsonrpc": "2.0",
+					"id":      999,
+					"result":  map[string]any{"stopReason": "wrong"},
+				}
+				d, _ := json.Marshal(extra)
+				writer.Write(append(d, '\n'))
+
+				chunk := map[string]any{
+					"jsonrpc": "2.0",
+					"method":  "session/update",
+					"params": map[string]any{
+						"sessionId": "sess-1",
+						"update": map[string]any{
+							"sessionUpdate": "agent_message_chunk",
+							"content":       map[string]any{"type": "text", "text": "ok"},
+						},
+					},
+				}
+				d, _ = json.Marshal(chunk)
+				writer.Write(append(d, '\n'))
+				writer.Flush()
+
+				resp = map[string]any{
+					"jsonrpc": "2.0",
+					"id":      req.ID,
+					"result":  map[string]any{"stopReason": "end_turn"},
+				}
+				break
+			}
+			if mode == "bad-json" {
+				writer.WriteString("not json\n")
+				writer.Flush()
+				time.Sleep(10 * time.Second)
+				continue
 			}
 			if mode == "unknown-method" {
 				// Send an unknown agent→client request
@@ -478,7 +649,7 @@ func TestBridgeRejectsPermissionRequest(t *testing.T) {
 	defer b.Close()
 
 	var chunks []string
-	_, err = b.Prompt([]ContentBlock{{Type: "text", Text: "create a file"}}, func(ev PromptEvent) {
+	_, err = b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "create a file"}}, func(ev PromptEvent) {
 		if ev.Type == EventText {
 			chunks = append(chunks, ev.Text)
 		}
@@ -518,7 +689,7 @@ func TestBridgeEmitsToolCallEvents(t *testing.T) {
 	defer b.Close()
 
 	var events []PromptEvent
-	_, err = b.Prompt([]ContentBlock{{Type: "text", Text: "list files"}}, func(ev PromptEvent) {
+	_, err = b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "list files"}}, func(ev PromptEvent) {
 		events = append(events, ev)
 	})
 	if err != nil {
@@ -634,11 +805,14 @@ func TestBridgeExtractsToolNameFromMeta(t *testing.T) {
 	defer b.Close()
 
 	var toolNames []string
-	b.Prompt([]ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {
+	_, err = b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {
 		if ev.Type == EventToolCall {
 			toolNames = append(toolNames, ev.ToolName)
 		}
 	})
+	if err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
 	if len(toolNames) != 1 {
 		t.Fatalf("got %d tool calls, want 1", len(toolNames))
 	}
@@ -669,7 +843,7 @@ func TestBridgeRespondsMethodNotFound(t *testing.T) {
 
 	// Prompt should complete — the unknown method gets a -32601 response, unblocking the agent
 	var chunks []string
-	_, err = b.Prompt([]ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {
+	_, err = b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {
 		if ev.Type == EventText {
 			chunks = append(chunks, ev.Text)
 		}
@@ -705,10 +879,11 @@ func TestBridgeSendsCancelNotification(t *testing.T) {
 	// Start prompt in goroutine, cancel after first chunk
 	done := make(chan error, 1)
 	go func() {
-		_, err := b.Prompt([]ContentBlock{{Type: "text", Text: "slow task"}}, func(ev PromptEvent) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		_, err := b.Prompt(ctx, []ContentBlock{{Type: "text", Text: "slow task"}}, func(ev PromptEvent) {
 			if ev.Type == EventText {
-				// Cancel after receiving first chunk
-				b.Cancel()
+				cancel()
 			}
 		})
 		done <- err
@@ -746,14 +921,14 @@ func TestBridgeReconnectsAfterRepeatedErrors(t *testing.T) {
 
 	// First 3 prompts return errors
 	for i := 0; i < 3; i++ {
-		_, err = b.Prompt([]ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {})
+		_, err = b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {})
 		if err == nil {
 			t.Fatalf("prompt %d should error", i)
 		}
 	}
 
 	// 4th prompt should succeed — bridge recreated session after 3 consecutive errors
-	_, err = b.Prompt([]ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {})
+	_, err = b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {})
 	if err != nil {
 		t.Fatalf("prompt after reconnect should succeed, got: %v", err)
 	}
@@ -779,7 +954,9 @@ func TestBridgeCapturesContextUsage(t *testing.T) {
 	}
 	defer b.Close()
 
-	b.Prompt([]ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {})
+	if _, err := b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {}); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
 
 	usage := b.Usage()
 	if usage.ContextPercent == 0 {
@@ -787,5 +964,362 @@ func TestBridgeCapturesContextUsage(t *testing.T) {
 	}
 	if usage.TotalTokens == 0 {
 		t.Error("expected non-zero estimated tokens")
+	}
+}
+
+func TestBridgeUsesContentFieldForPrompt(t *testing.T) {
+	oldExecCommand := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cs := []string{"-test.run=TestBridgeHelperProcess", "--"}
+		cs = append(cs, args...)
+		cmd := exec.Command(os.Args[0], cs...)
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_HELPER_PROCESS=1",
+			"KIRO_BRIDGE_HELPER_MODE=content-field",
+		)
+		return cmd
+	}
+	defer func() { execCommand = oldExecCommand }()
+
+	b, err := NewBridge(BridgeConfig{CLIPath: "kiro-cli", CWD: ".", Agent: "", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewBridge: %v", err)
+	}
+	defer b.Close()
+
+	if _, err := b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {}); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+}
+
+func TestBridgeLoadSession(t *testing.T) {
+	oldExecCommand := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cs := []string{"-test.run=TestBridgeHelperProcess", "--"}
+		cs = append(cs, args...)
+		cmd := exec.Command(os.Args[0], cs...)
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_HELPER_PROCESS=1",
+			"KIRO_BRIDGE_HELPER_MODE=with-models",
+		)
+		return cmd
+	}
+	defer func() { execCommand = oldExecCommand }()
+
+	rawBridge, err := NewBridge(BridgeConfig{CLIPath: "kiro-cli", CWD: ".", Agent: "", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewBridge: %v", err)
+	}
+	defer rawBridge.Close()
+
+	internal := rawBridge.(*bridge)
+	proc, ready := internal.currentProcess()
+	if !ready || proc == nil {
+		t.Fatal("bridge should be ready")
+	}
+
+	manager := &acpSessionManager{bridge: internal, process: proc}
+	session, err := manager.LoadSession("existing-session")
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if session.id != "loaded-session" {
+		t.Fatalf("session id = %q, want loaded-session", session.id)
+	}
+}
+
+func TestBridgeTurnEndOverridesPromptResult(t *testing.T) {
+	oldExecCommand := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cs := []string{"-test.run=TestBridgeHelperProcess", "--"}
+		cs = append(cs, args...)
+		cmd := exec.Command(os.Args[0], cs...)
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_HELPER_PROCESS=1",
+			"KIRO_BRIDGE_HELPER_MODE=turn-end",
+		)
+		return cmd
+	}
+	defer func() { execCommand = oldExecCommand }()
+
+	b, err := NewBridge(BridgeConfig{CLIPath: "kiro-cli", CWD: ".", Agent: "", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewBridge: %v", err)
+	}
+	defer b.Close()
+
+	stopReason, err := b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {})
+	if err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	if stopReason != "max_tokens" {
+		t.Fatalf("stop reason = %q, want max_tokens", stopReason)
+	}
+}
+
+func TestBridgeSessionModes(t *testing.T) {
+	oldExecCommand := execCommand
+	oldMode := os.Getenv("KIRO_BRIDGE_SESSION_MODE")
+	defer func() {
+		execCommand = oldExecCommand
+		if oldMode == "" {
+			os.Unsetenv("KIRO_BRIDGE_SESSION_MODE")
+		} else {
+			os.Setenv("KIRO_BRIDGE_SESSION_MODE", oldMode)
+		}
+	}()
+
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cs := []string{"-test.run=TestBridgeHelperProcess", "--"}
+		cs = append(cs, args...)
+		cmd := exec.Command(os.Args[0], cs...)
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_HELPER_PROCESS=1",
+			"KIRO_BRIDGE_HELPER_MODE=session-ids",
+		)
+		return cmd
+	}
+
+	t.Run("per_request uses different sessions", func(t *testing.T) {
+		os.Unsetenv("KIRO_BRIDGE_SESSION_MODE")
+		b, err := NewBridge(BridgeConfig{CLIPath: "kiro-cli", CWD: ".", Agent: "", Version: "test"})
+		if err != nil {
+			t.Fatalf("NewBridge: %v", err)
+		}
+		defer b.Close()
+
+		var sessions []string
+		for i := 0; i < 2; i++ {
+			_, err := b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {
+				if ev.Type == EventText {
+					sessions = append(sessions, ev.Text)
+				}
+			})
+			if err != nil {
+				t.Fatalf("Prompt: %v", err)
+			}
+		}
+		if len(sessions) != 2 || sessions[0] == sessions[1] {
+			t.Fatalf("sessions = %v, want two distinct ids", sessions)
+		}
+	})
+
+	t.Run("shared reuses one session", func(t *testing.T) {
+		os.Setenv("KIRO_BRIDGE_SESSION_MODE", string(SessionModeShared))
+		b, err := NewBridge(BridgeConfig{CLIPath: "kiro-cli", CWD: ".", Agent: "", Version: "test"})
+		if err != nil {
+			t.Fatalf("NewBridge: %v", err)
+		}
+		defer b.Close()
+
+		var sessions []string
+		for i := 0; i < 2; i++ {
+			_, err := b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {
+				if ev.Type == EventText {
+					sessions = append(sessions, ev.Text)
+				}
+			})
+			if err != nil {
+				t.Fatalf("Prompt: %v", err)
+			}
+		}
+		if len(sessions) != 2 || sessions[0] != sessions[1] {
+			t.Fatalf("sessions = %v, want reused shared id", sessions)
+		}
+	})
+}
+
+func TestBridgeRecoversAfterProcessExit(t *testing.T) {
+	oldExecCommand := execCommand
+	var launches int
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		launches++
+		mode := "with-metadata"
+		if launches == 1 {
+			mode = "crash-on-prompt"
+		}
+		cs := []string{"-test.run=TestBridgeHelperProcess", "--"}
+		cs = append(cs, args...)
+		cmd := exec.Command(os.Args[0], cs...)
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_HELPER_PROCESS=1",
+			"KIRO_BRIDGE_HELPER_MODE="+mode,
+		)
+		return cmd
+	}
+	defer func() { execCommand = oldExecCommand }()
+
+	b, err := NewBridge(BridgeConfig{CLIPath: "kiro-cli", CWD: ".", Agent: "", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewBridge: %v", err)
+	}
+	defer b.Close()
+
+	if _, err := b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {}); err == nil {
+		t.Fatal("first prompt should fail when process crashes")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !b.Ready() && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !b.Ready() {
+		t.Fatal("bridge did not recover readiness after process exit")
+	}
+
+	if _, err := b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {}); err != nil {
+		t.Fatalf("prompt after reconnect should succeed: %v", err)
+	}
+}
+
+func TestBridgeCancelTimeoutForceClosesProcess(t *testing.T) {
+	oldExecCommand := execCommand
+	countFile := t.TempDir() + "/cancel-count.txt"
+	var launches int
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		launches++
+		mode := "with-metadata"
+		if launches == 1 {
+			mode = "cancel-hangs"
+		}
+		cs := []string{"-test.run=TestBridgeHelperProcess", "--"}
+		cs = append(cs, args...)
+		cmd := exec.Command(os.Args[0], cs...)
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_HELPER_PROCESS=1",
+			"KIRO_BRIDGE_HELPER_MODE="+mode,
+			"KIRO_BRIDGE_HELPER_COUNT_FILE="+countFile,
+		)
+		return cmd
+	}
+	defer func() { execCommand = oldExecCommand }()
+
+	b, err := NewBridge(BridgeConfig{CLIPath: "kiro-cli", CWD: ".", Agent: "", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewBridge: %v", err)
+	}
+	defer b.Close()
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		_, err := b.Prompt(ctx, []ContentBlock{{Type: "text", Text: "slow task"}}, func(ev PromptEvent) {
+			if ev.Type == EventText {
+				cancel()
+			}
+		})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Prompt error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Prompt did not return after forced cancel")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("cancel path took too long: %s", elapsed)
+	}
+
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if strings.Count(string(data), "cancel\n") != 1 {
+		t.Fatalf("cancel count = %q, want exactly one cancel", string(data))
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !b.Ready() && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !b.Ready() {
+		t.Fatal("bridge did not recover readiness after forced close")
+	}
+	if _, err := b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "test"}}, func(PromptEvent) {}); err != nil {
+		t.Fatalf("prompt after reconnect should succeed: %v", err)
+	}
+}
+
+func TestBridgeMatchesResponsesByID(t *testing.T) {
+	oldExecCommand := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		cs := []string{"-test.run=TestBridgeHelperProcess", "--"}
+		cs = append(cs, args...)
+		cmd := exec.Command(os.Args[0], cs...)
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_HELPER_PROCESS=1",
+			"KIRO_BRIDGE_HELPER_MODE=response-shuffle",
+		)
+		return cmd
+	}
+	defer func() { execCommand = oldExecCommand }()
+
+	b, err := NewBridge(BridgeConfig{CLIPath: "kiro-cli", CWD: ".", Agent: "", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewBridge: %v", err)
+	}
+	defer b.Close()
+
+	var chunks []string
+	stopReason, err := b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "test"}}, func(ev PromptEvent) {
+		if ev.Type == EventText {
+			chunks = append(chunks, ev.Text)
+		}
+	})
+	if err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	if stopReason != "end_turn" {
+		t.Fatalf("stop reason = %q, want end_turn", stopReason)
+	}
+	if len(chunks) != 1 || chunks[0] != "ok" {
+		t.Fatalf("chunks = %v, want [ok]", chunks)
+	}
+}
+
+func TestBridgeRecoversAfterMalformedJSON(t *testing.T) {
+	oldExecCommand := execCommand
+	var launches int
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		launches++
+		mode := "with-metadata"
+		if launches == 1 {
+			mode = "bad-json"
+		}
+		cs := []string{"-test.run=TestBridgeHelperProcess", "--"}
+		cs = append(cs, args...)
+		cmd := exec.Command(os.Args[0], cs...)
+		cmd.Env = append(os.Environ(),
+			"GO_WANT_HELPER_PROCESS=1",
+			"KIRO_BRIDGE_HELPER_MODE="+mode,
+		)
+		return cmd
+	}
+	defer func() { execCommand = oldExecCommand }()
+
+	b, err := NewBridge(BridgeConfig{CLIPath: "kiro-cli", CWD: ".", Agent: "", Version: "test"})
+	if err != nil {
+		t.Fatalf("NewBridge: %v", err)
+	}
+	defer b.Close()
+
+	if _, err := b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "test"}}, func(PromptEvent) {}); err == nil {
+		t.Fatal("first prompt should fail on malformed JSON")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !b.Ready() && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !b.Ready() {
+		t.Fatal("bridge did not recover readiness after malformed JSON")
+	}
+	if _, err := b.Prompt(context.Background(), []ContentBlock{{Type: "text", Text: "test"}}, func(PromptEvent) {}); err != nil {
+		t.Fatalf("prompt after reconnect should succeed: %v", err)
 	}
 }

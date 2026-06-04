@@ -35,7 +35,7 @@ func TestE2EStreamResponse(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", handleChatCompletions(b))
-	mux.HandleFunc("/v1/models", handleModels)
+	mux.HandleFunc("/v1/models", handleModels(b))
 	server := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%s", port), Handler: mux}
 	go server.ListenAndServe()
 	defer server.Close()
@@ -120,7 +120,7 @@ func TestE2ENonStreamResponse(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", handleChatCompletions(b))
-	mux.HandleFunc("/v1/models", handleModels)
+	mux.HandleFunc("/v1/models", handleModels(b))
 	server := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%s", port), Handler: mux}
 	go server.ListenAndServe()
 	defer server.Close()

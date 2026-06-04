@@ -28,6 +28,8 @@ func (id *RPCID) UnmarshalJSON(data []byte) error {
 func IntID(n int) RPCID  { return RPCID{Num: n} }
 func StrID(s string) RPCID { return RPCID{Str: s} }
 
+// Request is a generic JSON-RPC request or request-like envelope used for ACP
+// commands coming from either the bridge or the child process.
 type Request struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      RPCID           `json:"id"`
@@ -35,6 +37,8 @@ type Request struct {
 	Params  json.RawMessage `json:"params,omitempty"`
 }
 
+// Response is the generic JSON-RPC response envelope paired with bridge-issued
+// ACP requests.
 type Response struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      RPCID           `json:"id"`
@@ -94,6 +98,8 @@ func isResponse(line []byte) bool {
 	return classifyMessage(line) == messageResponse
 }
 
+// RPCError preserves ACP/JSON-RPC error payloads so higher layers can report
+// agent failures without losing protocol context.
 type RPCError struct {
 	Code    int              `json:"code"`
 	Message string           `json:"message"`
@@ -107,6 +113,8 @@ func (e *RPCError) Error() string {
 	return fmt.Sprintf("code %d: %s", e.Code, e.Message)
 }
 
+// Notification is the generic JSON-RPC notification envelope used for ACP
+// session updates and Kiro-specific extension events.
 type Notification struct {
 	JSONRPC string          `json:"jsonrpc"`
 	Method  string          `json:"method"`
@@ -115,31 +123,37 @@ type Notification struct {
 
 // ACP param/result types
 
+// InitializeParams declares the client capabilities the bridge presents to ACP.
 type InitializeParams struct {
 	ProtocolVersion    int                `json:"protocolVersion"`
 	ClientCapabilities ClientCapabilities `json:"clientCapabilities"`
 	ClientInfo         ClientInfo         `json:"clientInfo"`
 }
 
+// ClientCapabilities is the subset of ACP capabilities the bridge currently advertises.
 type ClientCapabilities struct {
 	PromptCapabilities *PromptCapabilities `json:"promptCapabilities,omitempty"`
 }
 
+// PromptCapabilities describes prompt content types supported by the bridge.
 type PromptCapabilities struct {
 	Image bool `json:"image"`
 }
 
+// ClientInfo identifies the bridge to the ACP server during initialization.
 type ClientInfo struct {
 	Name    string `json:"name"`
 	Title   string `json:"title"`
 	Version string `json:"version"`
 }
 
+// InitializeResult captures the server capability metadata returned by ACP.
 type InitializeResult struct {
 	ProtocolVersion   int             `json:"protocolVersion"`
 	AgentCapabilities json.RawMessage `json:"agentCapabilities"`
 }
 
+// SessionNewParams requests a fresh ACP session rooted at a working directory.
 type SessionNewParams struct {
 	CWD        string `json:"cwd"`
 	MCPServers []any  `json:"mcpServers"`
@@ -149,27 +163,44 @@ func NewSessionNewParams(cwd string) SessionNewParams {
 	return SessionNewParams{CWD: cwd, MCPServers: []any{}}
 }
 
+// SessionNewResult holds the ACP session identifier and optional model catalog
+// returned when a new session is created.
 type SessionNewResult struct {
 	SessionID string           `json:"sessionId"`
 	Models    *SessionModels   `json:"models,omitempty"`
 }
 
+// SessionLoadParams requests an existing ACP session by identifier.
+type SessionLoadParams struct {
+	SessionID string `json:"sessionId"`
+}
+
+// SessionLoadResult mirrors the load-session response shape used internally by the bridge.
+type SessionLoadResult struct {
+	SessionID string         `json:"sessionId"`
+	Models    *SessionModels `json:"models,omitempty"`
+}
+
+// SessionModels is the model catalog returned by ACP for a session context.
 type SessionModels struct {
 	CurrentModelID  string         `json:"currentModelId"`
 	AvailableModels []SessionModel `json:"availableModels"`
 }
 
+// SessionModel is one ACP model descriptor inside a session model catalog.
 type SessionModel struct {
 	ModelID     string `json:"modelId"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
 }
 
+// SessionPromptParams is the ACP request payload for one prompt turn.
 type SessionPromptParams struct {
 	SessionID string         `json:"sessionId"`
-	Prompt    []ContentBlock `json:"prompt"`
+	Content   []ContentBlock `json:"content"`
 }
 
+// ContentBlock is the bridge's shared representation for ACP prompt content.
 type ContentBlock struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
@@ -177,30 +208,38 @@ type ContentBlock struct {
 	Data     string `json:"data,omitempty"`
 }
 
+// SessionPromptResult captures the fallback stop reason returned in the final
+// prompt response when no explicit TurnEnd update is observed.
 type SessionPromptResult struct {
 	StopReason string `json:"stopReason"`
 }
 
+// SessionSetModeParams switches an ACP session onto a named Kiro agent mode.
 type SessionSetModeParams struct {
 	SessionID string `json:"sessionId"`
 	ModeID    string `json:"modeId"`
 }
 
+// SessionCancelParams identifies the ACP session whose current turn should be cancelled.
 type SessionCancelParams struct {
 	SessionID string `json:"sessionId"`
 }
 
+// SessionUpdateParams wraps one ACP session update notification payload.
 type SessionUpdateParams struct {
 	SessionID string          `json:"sessionId"`
 	Update    json.RawMessage `json:"update"`
 }
 
+// SessionUpdate is the normalized outer shape used to decode ACP session
+// notifications before they are mapped into bridge prompt events.
 type SessionUpdate struct {
 	SessionUpdate string          `json:"sessionUpdate"`
 	Content       json.RawMessage `json:"content,omitempty"`
 	ToolCallID    string          `json:"toolCallId,omitempty"`
 	Title         string          `json:"title,omitempty"`
 	Status        string          `json:"status,omitempty"`
+	StopReason    string          `json:"stopReason,omitempty"`
 }
 
 // ContentText extracts text from a content field that may be a single ContentBlock or an array.
@@ -212,6 +251,15 @@ func (su *SessionUpdate) ContentText() string {
 	var block ContentBlock
 	if err := json.Unmarshal(su.Content, &block); err == nil && block.Text != "" {
 		return block.Text
+	}
+	// Some ACP updates carry content as an array of blocks instead of a single block.
+	var blocks []ContentBlock
+	if err := json.Unmarshal(su.Content, &blocks); err == nil {
+		var text string
+		for _, block := range blocks {
+			text += block.Text
+		}
+		return text
 	}
 	return ""
 }
