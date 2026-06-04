@@ -51,7 +51,15 @@ Optionally, add `resources` to load steering docs into every session:
 ]
 ```
 
-### 3. Run it
+### 3. Configure `.env`
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` as needed. The bridge loads `.env` from the current working directory automatically. Real environment variables still win if both are set. If you need a different dotenv path, set `KIRO_BRIDGE_ENV_FILE=/absolute/path/to/.env` in the parent process environment, not inside `.env` itself.
+
+### 4. Run it
 
 ```bash
 ./kiro-bridge
@@ -62,7 +70,7 @@ go run .
 
 That's it — the bridge is running at `http://127.0.0.1:11435/v1`. No background service needed to try it out. See [Running as a background service](#running-as-a-background-service) when you want it always-on.
 
-### 4. Connect your client
+### 5. Connect your client
 
 The bridge exposes an OpenAI-compatible API at `http://127.0.0.1:11435/v1`. Point any OpenAI-compatible client at it.
 
@@ -73,10 +81,11 @@ providers:
   - id: kiro
     name: Kiro
     base_url: http://localhost:11435/v1
+    api_key: change-me
     models:
       - id: kiro
         name: "Kiro (Claude via ACP)"
-        context: 200000
+        context: 218000
         abilities:
           temperature:
             supported: false
@@ -108,6 +117,8 @@ All configuration is via environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `KIRO_BRIDGE_PORT` | `11435` | HTTP server port |
+| `KIRO_BRIDGE_API_KEY` | none, required | Bearer token required on `/v1/*` requests |
+| `KIRO_BRIDGE_ENV_FILE` | `.env` in current working directory | Optional dotenv path, but it must be set in the parent process environment because it decides which file gets loaded |
 | `KIRO_BRIDGE_CWD` | current directory | Working directory for ACP sessions |
 | `KIRO_CLI_PATH` | `kiro-cli` | Path to kiro-cli binary |
 | `KIRO_BRIDGE_AGENT` | `kiro-bridge` | Kiro agent config to activate |
@@ -116,7 +127,7 @@ All configuration is via environment variables:
 | `KIRO_BRIDGE_SHOW_TOOLS` | unset | Set to show tool call annotations in responses (experimental) |
 | `KIRO_BRIDGE_SESSION_MODE` | `per_request` | ACP session strategy: `per_request` creates a new session for each HTTP request, `shared` reuses one session |
 | `KIRO_BRIDGE_ALL_IP` | unset | Set to bind the HTTP server to `0.0.0.0` instead of `127.0.0.1` |
-| `KIRO_BRIDGE_CONTEXT_WINDOW` | `200000` | Context window size for token usage estimation |
+| `KIRO_BRIDGE_CONTEXT_WINDOW` | `218000` | Context window size for token usage estimation |
 
 ## Running as a background service
 
@@ -135,6 +146,8 @@ Create `~/Library/LaunchAgents/com.kiro-bridge.plist`:
   <string>/path/to/kiro-bridge</string>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>KIRO_BRIDGE_ENV_FILE</key>
+    <string>/Users/you/path/to/kiro-bridge/.env</string>
     <key>KIRO_BRIDGE_CWD</key>
     <string>/Users/you</string>
     <key>KIRO_CLI_PATH</key>
@@ -192,6 +205,8 @@ git push origin "$(git branch --show-current)" --tags
 ## How it works
 
 - The bridge spawns `kiro-cli acp` as a child process and communicates via JSON-RPC over stdio.
+- On startup it loads configuration from `.env` in the current working directory, unless `KIRO_BRIDGE_ENV_FILE` points to a different file. Existing process environment variables override dotenv values.
+- Public OpenAI-compatible endpoints require `Authorization: Bearer <KIRO_BRIDGE_API_KEY>`. `/healthz` stays unauthenticated for liveness checks.
 - On startup failure or child-process exit, it retries with exponential backoff (1s→60s cap) instead of crashing. The HTTP server starts immediately and returns 503 while connecting or reconnecting.
 - It keeps one supervised ACP process alive and, by default, creates a fresh ACP session for each HTTP request. Set `KIRO_BRIDGE_SESSION_MODE=shared` to reuse a single ACP session instead.
 - Incoming OpenAI `/v1/chat/completions` requests are translated to ACP `session/prompt` calls using `params.prompt`.

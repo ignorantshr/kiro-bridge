@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -157,6 +158,7 @@ func TestEnvDefaults(t *testing.T) {
 		}
 	})
 	t.Run("PORT defaults to 11435", func(t *testing.T) {
+		t.Setenv("KIRO_BRIDGE_PORT", "")
 		if got := env("KIRO_BRIDGE_PORT", "11435"); got != "11435" {
 			t.Errorf("got %q", got)
 		}
@@ -198,6 +200,92 @@ func TestEnvDefaults(t *testing.T) {
 		t.Setenv("KIRO_BRIDGE_AGENT", "custom-agent")
 		if got := env("KIRO_BRIDGE_AGENT", "kiro-bridge"); got != "custom-agent" {
 			t.Errorf("got %q", got)
+		}
+	})
+}
+
+func TestLoadBridgeAPIKey(t *testing.T) {
+	t.Run("returns error when unset", func(t *testing.T) {
+		t.Setenv("KIRO_BRIDGE_API_KEY", "")
+		_, err := loadBridgeAPIKey()
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("trims configured token", func(t *testing.T) {
+		t.Setenv("KIRO_BRIDGE_API_KEY", "  secret-token  ")
+		apiKey, err := loadBridgeAPIKey()
+		if err != nil {
+			t.Fatalf("loadBridgeAPIKey: %v", err)
+		}
+		if apiKey != "secret-token" {
+			t.Fatalf("apiKey = %q, want %q", apiKey, "secret-token")
+		}
+	})
+}
+
+func TestIsAuthorizedBearerToken(t *testing.T) {
+	testCases := []struct {
+		name   string
+		header string
+		want   bool
+	}{
+		{name: "missing header"},
+		{name: "wrong scheme", header: "Basic secret-token"},
+		{name: "missing token", header: "Bearer"},
+		{name: "wrong token", header: "Bearer nope"},
+		{name: "correct token", header: "Bearer secret-token", want: true},
+		{name: "case-insensitive scheme", header: "bearer secret-token", want: true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isAuthorizedBearerToken(tc.header, "secret-token")
+			if got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBearerAuthMiddleware(t *testing.T) {
+	handler := bearerAuthMiddleware("secret-token")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	t.Run("rejects missing token", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", w.Code)
+		}
+		if got := w.Header().Get("WWW-Authenticate"); !strings.Contains(got, "Bearer") {
+			t.Fatalf("WWW-Authenticate = %q, want Bearer", got)
+		}
+
+		var resp openAIErrorResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal error response: %v", err)
+		}
+		if resp.Error.Type != "authentication_error" {
+			t.Fatalf("type = %q, want authentication_error", resp.Error.Type)
+		}
+		if resp.Error.Code != "invalid_api_key" {
+			t.Fatalf("code = %q, want invalid_api_key", resp.Error.Code)
+		}
+	})
+
+	t.Run("allows correct token", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+		req.Header.Set("Authorization", "Bearer secret-token")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204", w.Code)
 		}
 	})
 }

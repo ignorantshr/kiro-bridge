@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -31,6 +33,20 @@ type bridgeHolder struct {
 	bridge Bridge
 }
 
+// openAIErrorResponse mirrors the JSON error envelope that OpenAI-compatible
+// clients already expect from REST API failures.
+type openAIErrorResponse struct {
+	Error openAIError `json:"error"`
+}
+
+// openAIError keeps the error payload shape stable across auth failures.
+type openAIError struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Param   any    `json:"param"`
+	Code    string `json:"code,omitempty"`
+}
+
 func (h *bridgeHolder) Set(b Bridge) {
 	h.mu.Lock()
 	h.bridge = b
@@ -44,6 +60,14 @@ func (h *bridgeHolder) Get() Bridge {
 }
 
 var newBridgeFunc = NewBridge
+
+func loadBridgeAPIKey() (string, error) {
+	apiKey := strings.TrimSpace(os.Getenv("KIRO_BRIDGE_API_KEY"))
+	if apiKey == "" {
+		return "", fmt.Errorf("KIRO_BRIDGE_API_KEY must be set")
+	}
+	return apiKey, nil
+}
 
 func connectWithBackoff(cfg BridgeConfig, holder *bridgeHolder, stop <-chan struct{}) {
 	delay := time.Second
@@ -72,17 +96,24 @@ func connectWithBackoff(cfg BridgeConfig, holder *bridgeHolder, stop <-chan stru
 }
 
 func main() {
+	if err := loadRuntimeEnvironment(); err != nil {
+		log.Fatal(err)
+	}
+
 	port := env("KIRO_BRIDGE_PORT", "11435")
 	cwd := env("KIRO_BRIDGE_CWD", ".")
 	cliPath := env("KIRO_CLI_PATH", "kiro-cli")
 	agent := env("KIRO_BRIDGE_AGENT", "kiro-bridge")
+	apiKey, err := loadBridgeAPIKey()
+	if err != nil {
+		log.Fatal(err)
+	}
 	host := "127.0.0.1"
 	if allIP {
 		host = "0.0.0.0"
 	}
 
 	if cwd == "." {
-		var err error
 		cwd, err = os.Getwd()
 		if err != nil {
 			log.Fatal(err)
@@ -98,15 +129,16 @@ func main() {
 	go connectWithBackoff(cfg, holder, stop)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+	guard := bearerAuthMiddleware(apiKey)
+	mux.Handle("/v1/chat/completions", guard(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b := holder.Get()
 		if b == nil || !b.Ready() {
 			http.Error(w, "bridge not ready", http.StatusServiceUnavailable)
 			return
 		}
 		handleChatCompletions(b)(w, r)
-	})
-	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	mux.Handle("/v1/models", guard(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b := holder.Get()
 		if b == nil || !b.Ready() {
 			// Return fallback model when bridge not ready
@@ -115,7 +147,7 @@ func main() {
 			return
 		}
 		handleModels(b)(w, r)
-	})
+	})))
 	mux.HandleFunc("/healthz", handleHealthz(holder))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		debugf("request: %s %s", r.Method, r.URL.Path)
@@ -178,6 +210,42 @@ func handleHealthz(holder *bridgeHolder) http.HandlerFunc {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok\n"))
 	}
+}
+
+// bearerAuthMiddleware enforces OpenAI-style bearer-token auth for the public
+// `/v1/*` endpoints while leaving internal liveness checks unauthenticated.
+func bearerAuthMiddleware(apiKey string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !isAuthorizedBearerToken(r.Header.Get("Authorization"), apiKey) {
+				writeAuthenticationError(w)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func isAuthorizedBearerToken(headerValue, expectedToken string) bool {
+	scheme, token, ok := strings.Cut(strings.TrimSpace(headerValue), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(expectedToken)) == 1
+}
+
+func writeAuthenticationError(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("WWW-Authenticate", `Bearer realm="kiro-bridge"`)
+	w.WriteHeader(http.StatusUnauthorized)
+	_ = json.NewEncoder(w).Encode(openAIErrorResponse{
+		Error: openAIError{
+			Message: "Invalid authentication credentials",
+			Type:    "authentication_error",
+			Param:   nil,
+			Code:    "invalid_api_key",
+		},
+	})
 }
 
 var verboseLog = os.Getenv("KIRO_BRIDGE_VERBOSE") != ""

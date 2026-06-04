@@ -60,7 +60,7 @@ Legend: ✅ Supported | ⚠️ Partial | ❌ Not supported | 🔄 Custom handlin
 | `choices[].message.content` | ✅ | From `agent_message_chunk`. |
 | `choices[].message.tool_calls` | ❌ | Not mapped. Text annotations behind FF instead. |
 | `choices[].finish_reason` | ✅ | Maps ACP stop reasons: end_turn→stop, max_tokens→length, etc. |
-| `usage` | ✅ | Estimated from `_kiro.dev/metadata` contextUsagePercentage × 200k context window. |
+| `usage` | ✅ | Estimated from `_kiro.dev/metadata` contextUsagePercentage × 218k context window. |
 | `system_fingerprint` | ❌ | Not generated. |
 
 ### Streaming

@@ -45,7 +45,7 @@ type UsageInfo struct {
 	TotalTokens    int
 }
 
-var contextWindow = parseContextWindow()
+var contextWindow = defaultContextWindow
 
 func parseContextWindow() int {
 	if v := os.Getenv("KIRO_BRIDGE_CONTEXT_WINDOW"); v != "" {
@@ -54,7 +54,7 @@ func parseContextWindow() int {
 			return n
 		}
 	}
-	return 200000
+	return defaultContextWindow
 }
 
 // ModelInfo is the OpenAI-facing view of an ACP model entry returned by Kiro.

@@ -9,8 +9,6 @@ import (
 	"log"
 	"mime"
 	"net/http"
-	"os"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -268,18 +266,10 @@ func fileExtension(name string) string {
 
 var completionCounter int64
 
-var maxBodyBytes int64 = 1 << 20 // 1MB default
+var maxBodyBytes int64 = defaultMaxBodyBytes
 
-var showToolAnnotations = os.Getenv("KIRO_BRIDGE_SHOW_TOOLS") != ""
-var allIP = os.Getenv("KIRO_BRIDGE_ALL_IP") != ""
-
-func init() {
-	if v := os.Getenv("KIRO_BRIDGE_MAX_BODY"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			maxBodyBytes = n
-		}
-	}
-}
+var showToolAnnotations bool
+var allIP bool
 
 func newCompletionID() string {
 	return fmt.Sprintf("chatcmpl-%d-%d", time.Now().Unix(), atomic.AddInt64(&completionCounter, 1))
