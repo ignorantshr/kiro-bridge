@@ -1,3 +1,5 @@
+version: 2
+
 project_name: kiro-bridge
 
 before:
@@ -15,7 +17,8 @@ builds:
       - arm64
 
 archives:
-  - format: tar.gz
+  - formats:
+      - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
 
 checksum:
